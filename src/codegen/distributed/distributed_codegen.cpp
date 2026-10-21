@@ -32,6 +32,7 @@
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/hierarchy/level_handler.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -53,6 +54,17 @@ namespace codegen {
 // is name-mangling-friendly while ``name=`` stays a stable runtime tag.
 namespace {
 constexpr const char kCommDomainHandlePrefix[] = "__";
+
+const hierarchy::LevelHandler& FormattingHandlerForFunction(const ir::FunctionPtr& func) {
+  const auto level = func ? func->level_.value_or(ir::Level::AIV) : ir::Level::AIV;
+  const auto* handler = hierarchy::GetLevelHandler(level);
+  // DistributedCodegen historically emits HOST templates even for standalone
+  // CHIP entries and unregistered higher levels. Preserve that output here;
+  // this fallback is formatting compatibility, not capability authorization.
+  // Resolve per consumer rather than caching across nested function emission.
+  if (!handler) handler = hierarchy::GetLevelHandler(ir::Level::HOST);
+  return *handler;
+}
 
 std::string HandleVarForScope(const ir::CommDomainScopeStmtPtr& scope) {
   return std::string(kCommDomainHandlePrefix) + scope->name_hint_;
@@ -250,20 +262,10 @@ std::vector<ir::FunctionPtr> DistributedCodegen::SortFunctionsByRoleAndLevel() c
 // ========================================================================
 
 void DistributedCodegen::EmitImports() {
-  emitter_.EmitLine("import torch");
-  // ``DataType`` is used when a comm-domain Buffer constructs its address-free
-  // wire Tensor view.
-  // ``CommBufferSpec`` is the spec list passed to ``orch.allocate_domain``
-  // inside host_orch when the program declares at least one comm domain;
-  // harmless to import for comm-less L3 programs.
-  emitter_.EmitLine(
-      "from simpler.task_interface import "
-      "CallConfig, CommBufferSpec, DataType, TaskArgs, TensorArgType");
-  emitter_.EmitLine("from pypto.runtime.tensor_arg import make_tensor_arg");
-  // ``_submit_chip`` resolves a comm-less dispatch's chip and namespaces the
-  // per-dispatch DFX ``output_prefix`` (``<base>/rank{worker}/d{k}``); the
-  // namespacing half is a no-op when DFX is off.
-  emitter_.EmitLine("from pypto.runtime.distributed_runner import add_chip_tensor_arg, _submit_chip");
+  // Module imports precede function emission, so current_func_ is not set yet.
+  for (const auto& line : hierarchy::GetLevelHandler(ir::Level::HOST)->GetImports()) {
+    emitter_.EmitLine(line);
+  }
 }
 
 void DistributedCodegen::EmitFunction(const ir::FunctionPtr& func) {
@@ -290,9 +292,11 @@ void DistributedCodegen::EmitFunction(const ir::FunctionPtr& func) {
   // with ``len(DistributedConfig.device_ids)``. ``pld.system.world_size()``
   // lowers to a bare reference to this kwarg.
   std::ostringstream sig;
-  sig << "def " << func->name_ << "(orch, _args, config, *, tensors, callables, sub_ids, _keep, world_size";
-  if (ir::LevelToLinquLevel(func->level_.value_or(ir::Level::AIV)) >= 3) {
-    sig << ", _domain_provider=None";
+  sig << "def " << func->name_ << "(orch, _args, config, *";
+  const bool accepts_domain_provider = ir::LevelToLinquLevel(func->level_.value_or(ir::Level::AIV)) >= 3;
+  for (const auto& keyword :
+       FormattingHandlerForFunction(func).GetEntryKeywordParams(accepts_domain_provider)) {
+    sig << ", " << keyword;
   }
   sig << "):";
   emitter_.EmitLine(sig.str());
@@ -532,19 +536,10 @@ void DistributedCodegen::VisitStmt_(const ir::CommDomainScopeStmtPtr& op) {
   const std::string handle_var = HandleVarForScope(op);
   const std::string& domain_name = op->name_hint_;
 
-  // workers: literal list of worker indices into DistributedConfig.device_ids.
-  // Empty devices_ in the IR means "all" — resolved at runtime via world_size.
-  std::ostringstream workers;
-  workers << "[";
-  if (op->devices_.empty()) {
-    workers << "*range(world_size)";
-  } else {
-    for (size_t i = 0; i < op->devices_.size(); ++i) {
-      if (i > 0) workers << ", ";
-      workers << op->devices_[i];
-    }
-  }
-  workers << "]";
+  const auto& handler = FormattingHandlerForFunction(current_func_);
+  // Membership indexes DistributedConfig.device_ids; an empty IR list means
+  // the full runtime world rather than an empty domain.
+  const std::string workers = handler.FormatDomainMembership(op->devices_);
 
   // Lower each slot's size_ expression to a Python string. Constant sizes
   // become int literals; dynamic sizes (e.g. `pld.world_size() * 4`) lower
@@ -583,10 +578,10 @@ void DistributedCodegen::VisitStmt_(const ir::CommDomainScopeStmtPtr& op) {
     window_size_expr << "(" << slot_alloc_nbytes[i] << ")";
   }
 
-  emitter_.EmitLine("with (_domain_provider or orch.allocate_domain)(");
+  emitter_.EmitLine("with " + handler.GetDomainAllocator() + "(");
   emitter_.IncreaseIndent();
   emitter_.EmitLine(std::string("name=\"") + domain_name + "\",");
-  emitter_.EmitLine("workers=" + workers.str() + ",");
+  emitter_.EmitLine("workers=" + workers + ",");
   emitter_.EmitLine("window_size=" + window_size_expr.str() + ",");
   emitter_.EmitLine("buffers=[");
   emitter_.IncreaseIndent();
@@ -1066,6 +1061,7 @@ void DistributedCodegen::VisitExpr_(const ir::ConstBoolPtr& op) {
 void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::FunctionPtr& callee,
                                           const ir::SubmitPtr& submit) {
   bool is_sub = IsSubWorker(callee);
+  const auto& handler = FormattingHandlerForFunction(current_func_);
   std::string ta_var = "_ta_" + std::to_string(task_args_counter_++);
 
   CHECK_SPAN(!submit || !is_sub, call->span_)
@@ -1142,7 +1138,8 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
     // the owning comm-domain Buffer. ``As<DistributedTensorType>`` is strict
     // ObjectKind match, so plain TensorType falls through to the worker-aware
     // make_tensor_arg path.
-    if (auto dist_type = ir::As<ir::DistributedTensorType>(call->args_[i]->GetType())) {
+    if (auto dist_type = ir::As<ir::DistributedTensorType>(call->args_[i]->GetType());
+        dist_type && handler.MaterializesWindowTensor()) {
       ++tensor_index;
       INTERNAL_CHECK_SPAN(!rank_expr.empty(), call->span_)
           << "Call passing DistributedTensor args must carry device= attr "
@@ -1179,9 +1176,8 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
         emitter_.EmitLine(ta_var + ".add_tensor(make_tensor_arg(orch._worker, tensors[\"" + arg_str +
                           "\"]), " + tag + ")");
       } else {
-        emitter_.EmitLine("add_chip_tensor_arg(" + ta_var + ", orch._worker, tensors[\"" + arg_str + "\"], " +
-                          tag + ", callables, \"" + callee->name_ + "\", " + std::to_string(tensor_index) +
-                          ")");
+        emitter_.EmitLine(handler.FormatHostTensorAppend(
+            {ta_var, "tensors[\"" + arg_str + "\"]", tag, "orch._worker", callee->name_, tensor_index}));
       }
       ++tensor_index;
       continue;
@@ -1679,7 +1675,7 @@ std::string DistributedCodegen::ResolveCommCtxArg(const ir::ExprPtr& arg, const 
   INTERNAL_CHECK_SPAN(window_buffer.has_value(), get_ctx->span_)
       << "pld.system.get_comm_ctx host lowering requires a window-bound DistributedTensor";
   const std::string handle_var = HandleVarForScope(ScopeForWindowBuffer(*window_buffer));
-  return handle_var + "[" + rank_expr + "].device_ctx";
+  return FormattingHandlerForFunction(current_func_).FormatCommCtxValue(handle_var, rank_expr);
 }
 
 std::string DistributedCodegen::FormatShapeTuple(const std::vector<ir::ExprPtr>& shape) {
