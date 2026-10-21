@@ -15,8 +15,10 @@ without a Worker. Resident tensors require a prepared Worker because their
 owner Buffer/provenance cannot belong to a temporary one-shot Worker.
 """
 
+import copy
 import json
 import warnings
+from dataclasses import asdict
 from unittest.mock import patch
 
 import pypto.language as pl
@@ -648,6 +650,334 @@ def test_c1d1_cluster_timeout_is_finite_positive_number(value):
 def test_c1d1_cluster_launcher_arguments_require_string_sequence(value):
     with pytest.raises((TypeError, ValueError), match="mpirun_args"):
         _c1d1_cluster(mpirun_args=value)
+
+
+def _c1d2_cluster_config():
+    return ir.ClusterConfig(
+        [ir.ClusterNodeSpec("node-a", [2, 3]), ir.ClusterNodeSpec("node-b", [4, 5])],
+        "/env/bin/python",
+        mpirun_args=["--bind-to", "none"],
+    )
+
+
+def _c1d2_entry_program(*, cluster=True, ambiguous=False):
+    """Post-pass order deliberately places a differently shaped HOST dependency first."""
+    span = ir.Span.unknown()
+
+    def function(name, level, role, extent, returns):
+        tensor = ir.TensorType([extent], DataType.FP32)
+        return ir.Function(
+            name,
+            [
+                (ir.Var(f"{name}_input", tensor, span), ParamDirection.In),
+                (ir.Var(f"{name}_output", tensor, span), ParamDirection.Out),
+            ],
+            [tensor] if returns else [],
+            ir.SeqStmts([], span),
+            span,
+            level=level,
+            role=role,
+        )
+
+    functions = [function("a_host_dependency", ir.Level.HOST, ir.Role.Orchestrator, 8, False)]
+    if cluster:
+        functions.extend(
+            [
+                function("cluster_sub_worker", ir.Level.CLUSTER_0, ir.Role.SubWorker, 16, False),
+                function("cluster_root", ir.Level.CLUSTER_0, ir.Role.Orchestrator, 64, True),
+            ]
+        )
+    if ambiguous:
+        functions.append(function("other_root", ir.Level.CLUSTER_0, ir.Role.Orchestrator, 128, False))
+    return ir.Program(functions, "c1d2_actual_entry", span)
+
+
+def _c1d2_cluster_record():
+    # A hand-authored cold artifact must be readable without current codegen.
+    return {
+        "schema": 4,
+        "entry_kind": "cluster",
+        "entry_name": "cluster_root",
+        "supported_execution_modes": ["program"],
+        "params": [
+            {"name": "cluster_root_input", "direction": "In", "shape": [64], "dtype": "fp32"},
+            {"name": "cluster_root_output", "direction": "Out", "shape": [64], "dtype": "fp32"},
+        ],
+        "num_return_types": 1,
+        "platform": "a2a3sim",
+        "backend_type": "Ascend910",
+        "cluster_config": json.loads(json.dumps(asdict(_c1d2_cluster_config()))),
+    }
+
+
+def _c1d2_write_record(tmp_path, record=None):
+    path = tmp_path / _DISTRIBUTED_META_FILENAME
+    path.write_text(json.dumps(_c1d2_cluster_record() if record is None else record))
+    return path
+
+
+def test_c1d2_actual_cluster_entry_owns_signature_and_metadata(tmp_path):
+    program = _c1d2_entry_program()
+    assert next(iter(program.functions.values())).level == ir.Level.HOST
+    compiled = DistributedCompiledProgram(program, str(tmp_path), cluster_config=_c1d2_cluster_config())
+    infos, outputs, returns = compiled._get_metadata()
+    assert [p.name for p in infos] == ["cluster_root_input", "cluster_root_output"]
+    assert [p.shape for p in infos] == [[64], [64]]
+    assert outputs == [1] and len(returns) == 1
+    assert compiled.entry_kind == "cluster" and compiled.entry_name == "cluster_root"
+    record = json.loads((tmp_path / _DISTRIBUTED_META_FILENAME).read_text())
+    assert record == _c1d2_cluster_record() | {"params": record["params"]}
+    assert record["params"][1]["direction"] == "Out"
+
+
+def test_c1d2_host_metadata_remains_schema_three(tmp_path):
+    compiled = DistributedCompiledProgram(_c1d2_entry_program(cluster=False), str(tmp_path))
+    assert compiled.entry_kind == "host"
+    record = json.loads((tmp_path / _DISTRIBUTED_META_FILENAME).read_text())
+    assert record["schema"] == 3 and "cluster_config" not in record
+    restored = DistributedCompiledProgram.from_dir(tmp_path, distributed_config=DistributedConfig([7]))
+    assert restored.entry_kind == "host" and restored._distributed_config.device_ids == [7]
+
+
+@pytest.mark.parametrize("case", ["missing", "host", "both", "mutated", "ambiguous", "wrong_kind"])
+def test_c1d2_live_entry_rejects_config_or_entry_mismatch(tmp_path, case):
+    config = _c1d2_cluster_config()
+    program = _c1d2_entry_program(cluster=case != "host", ambiguous=case == "ambiguous")
+    kwargs = {} if case == "missing" else {"cluster_config": config}
+    if case == "both":
+        kwargs["distributed_config"] = DistributedConfig()
+    if case == "mutated":
+        config.nodes[0].devices[0] = True
+    if case == "wrong_kind":
+        kwargs["entry_kind"] = "host"
+    with pytest.raises(ValueError, match=r"(?i)(cluster|config|entry|ambiguous|orchestrat)"):
+        DistributedCompiledProgram(program, str(tmp_path), **kwargs)
+    assert not (tmp_path / _DISTRIBUTED_META_FILENAME).exists()
+
+
+def test_c1d2_cluster_config_is_a_validated_owned_snapshot(tmp_path):
+    config = _c1d2_cluster_config()
+    compiled = DistributedCompiledProgram(_c1d2_entry_program(), str(tmp_path), cluster_config=config)
+    config.nodes[0].devices[0] = 99
+    config.mpirun_args = ("--changed",)
+    assert compiled.cluster_config.nodes[0].devices == [2, 3]
+    assert compiled.cluster_config.mpirun_args == ("--bind-to", "none")
+    saved = json.loads((tmp_path / _DISTRIBUTED_META_FILENAME).read_text())
+    assert saved["cluster_config"]["nodes"][0]["devices"] == [2, 3]
+
+
+@pytest.mark.parametrize("cluster", [False, True])
+def test_c1d2_reused_output_directory_keeps_only_actual_entry_marker(tmp_path, cluster):
+    orch = tmp_path / "orchestration"
+    orch.mkdir()
+    host = orch / "host_orch.py"
+    pod = orch / "cluster_orch.py"
+    host.write_text("# old or current host entry\n")
+    pod.write_text("# old or current cluster entry\n")
+    kwargs = {"cluster_config": _c1d2_cluster_config()} if cluster else {}
+    DistributedCompiledProgram(_c1d2_entry_program(cluster=cluster), str(tmp_path), **kwargs)
+    assert host.exists() is (not cluster)
+    assert pod.exists() is cluster
+    record = json.loads((tmp_path / _DISTRIBUTED_META_FILENAME).read_text())
+    assert record["schema"] == (4 if cluster else 3)
+    assert ("cluster_config" in record) is cluster
+
+
+@pytest.mark.parametrize("level", [ir.Level.CLUSTER_1, ir.Level.CLUSTER_2, ir.Level.GLOBAL])
+def test_c1d2_direct_wrapper_rejects_above_l4_before_artifact_mutation(tmp_path, level):
+    span = ir.Span.unknown()
+    root = ir.Function(
+        "higher_root", [], [], ir.SeqStmts([], span), span, level=level, role=ir.Role.Orchestrator
+    )
+    program = ir.Program([root], "UnsupportedHigherEntry", span)
+    (tmp_path / _DISTRIBUTED_META_FILENAME).write_text("# existing metadata must survive\n")
+    orch = tmp_path / "orchestration"
+    orch.mkdir()
+    (orch / "host_orch.py").write_text("# existing host entry\n")
+    (orch / "cluster_orch.py").write_text("# existing cluster entry\n")
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    with pytest.raises(
+        NotImplementedError, match=r"(?i)(cluster|higher|L5|L6|global).*(support|entry|metadata)"
+    ):
+        DistributedCompiledProgram(program, str(tmp_path), cluster_config=_c1d2_cluster_config())
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+
+
+def test_c1d2_cold_cluster_restore_preserves_files_and_contract(tmp_path, monkeypatch):
+    path = _c1d2_write_record(tmp_path)
+    debug = tmp_path / "debug" / "run.py"
+    debug.parent.mkdir()
+    debug.write_text("# user changes\n")
+    config = tmp_path / "kernel_config.py"
+    config.write_text("raise AssertionError('must not import stale chip config')\n")
+    before = {p: p.read_bytes() for p in (path, debug, config)}
+    with patch("pypto.runtime.distributed_runner._execute_distributed", side_effect=AssertionError):
+        restored = DistributedCompiledProgram.from_dir(tmp_path)
+    assert restored.program is None and restored.entry_kind == "cluster"
+    assert restored.entry_name == "cluster_root"
+    assert restored.cluster_config == _c1d2_cluster_config()
+    infos, outputs, returns = restored._get_metadata()
+    assert [p.shape for p in infos] == [[64], [64]]
+    assert outputs == [1] and len(returns) == 1
+    assert restored.platform == "a2a3sim"
+    assert restored.execution_capabilities.record() == ["program"]
+    assert all(p.read_bytes() == data for p, data in before.items())
+
+
+@pytest.mark.parametrize("override", ["equal", "changed", "distributed", "mutated"])
+def test_c1d2_cluster_reload_config_override_must_match_persisted_topology(tmp_path, override):
+    _c1d2_write_record(tmp_path)
+    config = _c1d2_cluster_config()
+    kwargs = {"cluster_config": config}
+    if override == "changed":
+        config.nodes[0].devices = [8, 9]
+    elif override == "distributed":
+        kwargs = {"distributed_config": DistributedConfig()}
+    elif override == "mutated":
+        config.nodes[0].devices = [True, 3]
+    if override == "equal":
+        restored = DistributedCompiledProgram.from_dir(tmp_path, **kwargs)
+        config.nodes[0].devices[0] = 99
+        assert restored.cluster_config == _c1d2_cluster_config()
+    else:
+        with pytest.raises(ValueError, match=r"(?i)(cluster|config|topology)"):
+            DistributedCompiledProgram.from_dir(tmp_path, **kwargs)
+
+
+_C1D2_BAD_CLUSTER_FIELDS = [
+    ("nodes", []),
+    ("nodes", "node-a"),
+    ("nodes", ["node-a"]),
+    ("nodes", [{"host": "node-a", "devices": [True]}]),
+    ("nodes", [{"host": "node-a", "devices": [0], "extra": 1}]),
+    ("nodes", [{"host": "node-a"}]),
+    ("nodes", [{"devices": [0]}]),
+    ("nodes", [{"host": "node-a", "devices": [0, 0]}]),
+    ("nodes", [{"host": "node-a", "devices": [-1]}]),
+    ("nodes", [{"host": "node-a", "devices": [0]}, {"host": "node-a", "devices": [0]}]),
+    ("nodes", [{"host": "node-a", "devices": [0]}, {"host": "node-b", "devices": [0, 1]}]),
+    ("python_executable", ""),
+    ("python_executable", 3),
+    ("comm_profile", "bad\nprofile"),
+    ("runtime", False),
+    ("num_sub_workers", True),
+    ("num_sub_workers", -1),
+    ("startup_timeout_s", True),
+    ("startup_timeout_s", 0),
+    ("mpirun_path", []),
+    ("mpirun_args", "--oversubscribe"),
+    ("mpirun_args", [3]),
+    ("aicpu_thread_num", True),
+    ("aicpu_thread_num", 1),
+    ("unknown", 1),
+]
+
+
+@pytest.mark.parametrize("field,value", _C1D2_BAD_CLUSTER_FIELDS)
+def test_c1d2_schema_four_strict_cluster_fields(tmp_path, field, value):
+    record = _c1d2_cluster_record()
+    record["cluster_config"][field] = value
+    _c1d2_write_record(tmp_path, record)
+    with pytest.raises(ValueError, match=r"distributed_meta\.json.*cluster_config") as error:
+        DistributedCompiledProgram.from_dir(tmp_path)
+    assert "ir.compile()" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing_config",
+        "null_config",
+        "list_config",
+        "missing_entry",
+        "null_entry",
+        "host_entry",
+        "unknown_entry",
+        "missing_name",
+        "empty_name",
+        "numeric_name",
+        "bool_schema",
+        "schema_three",
+        "schema_five",
+        "distributed_config",
+        "missing_python",
+        "missing_nodes",
+    ],
+)
+def test_c1d2_schema_entry_and_config_matrix_rejected(tmp_path, change):
+    record = copy.deepcopy(_c1d2_cluster_record())
+    if change.startswith("missing_"):
+        key = {
+            "missing_config": "cluster_config",
+            "missing_entry": "entry_kind",
+            "missing_name": "entry_name",
+        }.get(change)
+        if key:
+            record.pop(key)
+        else:
+            record["cluster_config"].pop("python_executable" if change == "missing_python" else "nodes")
+    elif change == "distributed_config":
+        record["distributed_config"] = {"device_ids": [0]}
+    else:
+        key, value = {
+            "null_config": ("cluster_config", None),
+            "list_config": ("cluster_config", []),
+            "null_entry": ("entry_kind", None),
+            "host_entry": ("entry_kind", "host"),
+            "unknown_entry": ("entry_kind", "pod-maybe"),
+            "empty_name": ("entry_name", ""),
+            "numeric_name": ("entry_name", 4),
+            "bool_schema": ("schema", True),
+            "schema_three": ("schema", 3),
+            "schema_five": ("schema", 5),
+        }[change]
+        record[key] = value
+    _c1d2_write_record(tmp_path, record)
+    with pytest.raises(ValueError, match=r"distributed_meta\.json"):
+        DistributedCompiledProgram.from_dir(tmp_path)
+
+
+def test_c1d2_old_schema_three_reader_rejects_valid_cluster_record(tmp_path):
+    from pypto.ir.compiled_program import _load_meta  # noqa: PLC0415
+
+    path = _c1d2_write_record(tmp_path)
+    with pytest.raises(ValueError, match="schema"):
+        _load_meta(path, filename=_DISTRIBUTED_META_FILENAME, schema=3)
+
+
+def test_c1d2_cluster_restore_reads_json_once(tmp_path, monkeypatch):
+    from pathlib import Path  # noqa: PLC0415
+
+    path = _c1d2_write_record(tmp_path)
+    original = Path.read_text
+    calls = []
+
+    def read_once(self, *args, **kwargs):
+        if self == path:
+            calls.append(self)
+            assert len(calls) == 1, "schema dispatch reopened metadata after validation"
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_once)
+    assert DistributedCompiledProgram.from_dir(tmp_path).entry_kind == "cluster"
+    assert calls == [path]
+
+
+@pytest.mark.parametrize("route", ["call", "prepare"])
+def test_c1d2_restored_cluster_execution_stops_before_host_runtime(tmp_path, monkeypatch, route):
+    _c1d2_write_record(tmp_path)
+    restored = DistributedCompiledProgram.from_dir(tmp_path)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("L4 metadata fell through to HOST worker startup or execution")
+
+    monkeypatch.setattr("pypto.runtime.distributed_runner._execute_distributed", forbidden)
+    monkeypatch.setattr("pypto.runtime.distributed_runner.DistributedWorker", forbidden)
+    with pytest.raises(NotImplementedError, match=r"(?i)(cluster|L4|POD).*(support|runner|execution)"):
+        if route == "call":
+            restored(torch.zeros(64), torch.zeros(64))
+        else:
+            restored.prepare()
 
 
 if __name__ == "__main__":

@@ -32,6 +32,20 @@ kernel. The build host still needs the target compiler, SDK and host runtime.
 
 ## Request flow
 
+`@jit.pod` and a captured `ClusterConfig` select the cluster identity contract,
+including schema-4 metadata and `orchestration/cluster_orch.py`. Fresh builds
+validate the actual post-pass root; cold and object hits validate the captured
+configuration against metadata. This adds no parallel AST hierarchy scanner and
+does not reparse ordinary warm JIT hits. A plain JIT may retain a supported HOST
+compiled object with its default `DistributedConfig`; its decorator spelling
+alone does not require a single-chip result.
+
+Public full POD compilation still rejects before cache lookup until cluster
+codegen and runner support land. Internal cluster metadata restoration does not
+promote binaries or execute. Missing cluster configuration and HOST artifacts
+cannot satisfy cluster requests. The recursive configuration fingerprint in the
+specialization key remains the sole topology fingerprint.
+
 1. Capture specialization, source namespaces, effective compiler options and
    cache policy. Diagnostics and explicit output requests compile afresh.
 2. Establish source, application-input and policy-selected toolchain identities.

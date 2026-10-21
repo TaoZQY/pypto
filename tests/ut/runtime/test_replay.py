@@ -16,6 +16,7 @@ without the optional ``simpler`` runtime package.
 from __future__ import annotations
 
 import importlib
+import json
 import warnings
 from pathlib import Path
 from unittest.mock import patch
@@ -662,6 +663,53 @@ def test_cli_platform_remains_supported_with_warnings_as_errors(
     assert config.backend_type == backend
     assert config.execution_mode is mode
     assert config.platform == platform
+
+
+@pytest.mark.parametrize("marker", ["clean", "stale_chip", "stale_host"])
+@pytest.mark.parametrize("route", ["api", "cli"])
+def test_c1d2_cluster_replay_rejects_before_routing_imports_or_mutation(tmp_path, monkeypatch, marker, route):
+    record = {
+        "schema": 4,
+        "entry_kind": "cluster",
+        "entry_name": "cluster_root",
+        "supported_execution_modes": ["program"],
+        "params": [],
+        "num_return_types": 0,
+        "platform": "a2a3sim",
+        "backend_type": "Ascend910",
+        "cluster_config": {
+            "nodes": [{"host": "node-a", "devices": [0]}],
+            "python_executable": "/env/bin/python",
+        },
+    }
+    (tmp_path / "distributed_meta.json").write_text(json.dumps(record))
+    orch = tmp_path / "orchestration"
+    orch.mkdir()
+    (orch / "cluster_orch.py").write_text("raise AssertionError('imported cluster entry')\n")
+    if marker == "stale_chip":
+        (tmp_path / "kernel_config.py").write_text("raise AssertionError('imported stale chip')\n")
+    elif marker == "stale_host":
+        (orch / "host_orch.py").write_text("raise AssertionError('imported stale host')\n")
+    (tmp_path / "golden.py").write_text("raise AssertionError('imported golden before entry validation')\n")
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("cluster replay entered rebuild, invalidation, golden import or HOST/CHIP execution")
+
+    for name in (
+        "rebuild_kernel_cpp_from_pto",
+        "invalidate_binary_cache",
+        "_load_golden_module",
+        "_load_named_inputs_from_golden",
+        "_execute_compiled",
+    ):
+        monkeypatch.setattr(replay_module, name, forbidden)
+    with pytest.raises(NotImplementedError, match=r"(?i)(cluster|L4|POD).*(support|runner|execution)"):
+        if route == "api":
+            replay(tmp_path, validate=True)
+        else:
+            _main([str(tmp_path), "--validate"])
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
 
 
 if __name__ == "__main__":

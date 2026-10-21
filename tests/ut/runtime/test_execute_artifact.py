@@ -404,5 +404,31 @@ def test_kernel_metadata_is_setup_failure_before_assembly(tmp_path, stub_compile
     stub_compile_and_assemble.assert_not_called()
 
 
+def test_c1d2_single_device_artifact_cli_rejects_cluster_before_compilation(
+    tmp_path, stub_compile_and_assemble
+):
+    record = {
+        "schema": 4,
+        "entry_kind": "cluster",
+        "entry_name": "cluster_root",
+        "supported_execution_modes": ["program"],
+        "params": [],
+        "num_return_types": 0,
+        "platform": "a2a3sim",
+        "backend_type": "Ascend910",
+        "cluster_config": {
+            "nodes": [{"host": "node-a", "devices": [0]}],
+            "python_executable": "/env/bin/python",
+        },
+    }
+    (tmp_path / "distributed_meta.json").write_text(json.dumps(record))
+    # A stale single-chip config must not select the old single-device path.
+    (tmp_path / "kernel_config.py").write_text("raise AssertionError('stale config import')\n")
+    stub_compile_and_assemble.side_effect = AssertionError("cluster reached chip compiler")
+    with pytest.raises(execute_artifact.ArtifactSetupError, match=r"(?i)(cluster|L4|POD)"):
+        execute_artifact._reconstruct_artifact(tmp_path, "a2a3sim")
+    stub_compile_and_assemble.assert_not_called()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

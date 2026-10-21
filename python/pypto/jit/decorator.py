@@ -3560,6 +3560,18 @@ class JITFunction:
         )
 
         compile_kwargs, bypass_cache = _resolve_compile_request(run_config)
+        cluster_config = compile_kwargs.get("cluster_config")
+        if cluster_config is not None:
+            _check_supported_orchestration_level(_ir.Level.CLUSTER_0)
+        if self._func_type == "pod" and cluster_config is None:
+            raise ValueError("POD entry requires ClusterConfig in cluster_config")
+
+        def validated(compiled: Any) -> Any:
+            from pypto.ir.distributed_compiled_program import _validate_compiled_entry  # noqa: PLC0415
+
+            _validate_compiled_entry(compiled, cluster_config)
+            return compiled
+
         target_platform = _platform_string(compile_kwargs["backend_type"], compile_kwargs["execution_mode"])
         cache_config = capture_cache_config(getattr(run_config, "cache_config", None))
         record_stats(requests=1)
@@ -3572,13 +3584,15 @@ class JITFunction:
         def build(**overrides: Any) -> Any:
             record_stats(generation_builds=1)
             with time_stage("build_ns"):
-                return self._compile(
-                    specialization.tensor_meta,
-                    specialization.scalar_dtypes,
-                    specialization.constexpr_values,
-                    specialization.per_func_dyn,
-                    pl,
-                    **(compile_kwargs | overrides),
+                return validated(
+                    self._compile(
+                        specialization.tensor_meta,
+                        specialization.scalar_dtypes,
+                        specialization.constexpr_values,
+                        specialization.per_func_dyn,
+                        pl,
+                        **(compile_kwargs | overrides),
+                    )
                 )
 
         if bypass_cache:
@@ -3626,13 +3640,14 @@ class JITFunction:
                     platform=target_platform,
                     runtime_name=runtime_kind_to_name(_resolve_runtime()),
                     distributed=self._func_type in {"host", "pod"},
+                    cluster_config=cluster_config,
                 )
             elif key in self._cache:
                 record_stats(object_hits=1)
                 compiled = self._cache[key]
             else:
                 compiled = self._cache[key] = build()
-        return compiled, ordered_args, run_config
+        return validated(compiled), ordered_args, run_config
 
     def _persistent_source_digest(self) -> str:
         """Memoize immutable graph content; refresh folded constants and externs."""

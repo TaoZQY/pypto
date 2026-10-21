@@ -1520,5 +1520,211 @@ def test_hashed_sidecar_pruning_preserves_configured_and_unrelated_inputs(tmp_pa
     assert not {source, configured, unrelated, external, external_binary}.intersection(outputs)
 
 
+def _c1d2_cluster_payload(root):
+    record = {
+        "schema": 4,
+        "entry_kind": "cluster",
+        "entry_name": "cluster_root",
+        "supported_execution_modes": ["program"],
+        "params": [],
+        "num_return_types": 0,
+        "platform": "a2a3sim",
+        "backend_type": "Ascend910",
+        "cluster_config": {
+            "nodes": [{"host": "node-a", "devices": [2]}],
+            "python_executable": "/env/bin/python",
+        },
+    }
+    _write(root / "distributed_meta.json", json.dumps(record))
+    # These sentinels catch accidental generated-code imports and flat L3 scanning.
+    _write(root / "orchestration/cluster_orch.py", "raise AssertionError('imported L4 entry')\n")
+    _write(
+        root / "next_levels/host/next_levels/chip/kernel_config.py",
+        "raise AssertionError('imported nested CHIP config')\n",
+    )
+    return record
+
+
+def _c1d2_cluster_spec():
+    return ArtifactSpec(
+        ArtifactState.GENERATED,
+        BuildKind.DISTRIBUTED,
+        ("distributed_meta.json", "orchestration/cluster_orch.py"),
+        entry_kind="cluster",
+    )
+
+
+def _c1d2_publish_cluster(tmp_path):
+    store = ArtifactStore(tmp_path / "cache", private_root=tmp_path / "private")
+    result = store.get_or_build(_key(), _c1d2_cluster_spec(), _c1d2_cluster_payload)
+    assert result.disposition is BuildDisposition.PUBLISHED and result.handle is not None
+    return store, result.handle
+
+
+def test_c1d2_real_store_cold_cluster_restore_is_metadata_only(tmp_path, monkeypatch):
+    store, handle = _c1d2_publish_cluster(tmp_path)
+    before = {p: p.read_bytes() for p in handle.directory.rglob("*") if p.is_file()}
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("cold cluster metadata restore entered a compiler or executable config loader")
+
+    monkeypatch.setattr("pypto.runtime._artifact_sources.read_kernel_config", forbidden)
+    monkeypatch.setattr("pypto.ir.compile", forbidden)
+    readonly = ArtifactStore(store.root, readonly=True)
+    hit = readonly.get_or_build(_key(), _c1d2_cluster_spec(), forbidden)
+    assert hit.disposition is BuildDisposition.HIT
+    restored = restore_artifact(readonly, hit.handle, tmp_path / "run")
+    assert isinstance(restored, DistributedCompiledProgram)
+    assert restored.program is None and restored.entry_kind == "cluster"
+    assert restored.entry_name == "cluster_root"
+    assert restored.cluster_config.nodes[0].devices == [2]
+    assert not (tmp_path / "run").exists()
+    assert {p: p.read_bytes() for p in before} == before
+
+
+@pytest.mark.parametrize("route", ["runtime_load", "prepare_prebuilt", "load_prebuilt", "ready_spec"])
+def test_c1d2_cluster_promotion_is_rejected_before_compiler_or_generated_import(tmp_path, monkeypatch, route):
+    store, handle = _c1d2_publish_cluster(tmp_path)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("L4 promotion used the flat HOST/CHIP compiler path")
+
+    monkeypatch.setattr("pypto.runtime._artifact_sources.read_kernel_config", forbidden)
+    monkeypatch.setattr("pypto.runtime._artifact_runtime.prepare_prebuilt", forbidden)
+    with pytest.raises(NotImplementedError, match=r"(?i)(cluster|L4|POD).*(support|compil|runner)"):
+        if route == "runtime_load":
+            ArtifactRuntime(store, handle, "a2a3sim", tmp_path / "run").load()
+        elif route == "ready_spec":
+            _prebuilt.ready_spec(handle.directory, handle.spec)
+        else:
+            getattr(_prebuilt, route)(handle.directory, "a2a3sim", BuildKind.DISTRIBUTED)
+    assert not (tmp_path / "run").exists()
+
+
+@pytest.mark.parametrize(
+    "mutation", ["host_metadata", "cluster_metadata_host_spec", "wrong_name", "wrong_topology"]
+)
+def test_c1d2_cluster_artifact_binding_validates_entry_identity(tmp_path, mutation):
+    store = ArtifactStore(tmp_path / "cache", private_root=tmp_path / "private")
+    source = tmp_path / "source"
+    _c1d2_cluster_payload(source)
+    compiled = DistributedCompiledProgram.from_dir(source)
+    spec = _c1d2_cluster_spec()
+
+    def build(root):
+        _c1d2_cluster_payload(root)
+        path = root / "distributed_meta.json"
+        record = json.loads(path.read_text())
+        if mutation == "host_metadata":
+            record.pop("cluster_config")
+            record.update(schema=3, entry_kind="host", distributed_config={})
+        elif mutation == "wrong_name":
+            record["entry_name"] = "different_cluster_root"
+        elif mutation == "wrong_topology":
+            record["cluster_config"]["nodes"][0]["devices"] = [7]
+        path.write_text(json.dumps(record))
+
+    if mutation == "cluster_metadata_host_spec":
+        spec = ArtifactSpec(
+            ArtifactState.GENERATED, BuildKind.DISTRIBUTED, spec.required_files, entry_kind="host"
+        )
+    result = store.get_or_build(_key(), spec, build)
+    with pytest.raises(ValueError, match=r"(?i)(entry|cluster|metadata)"):
+        bind_artifact(compiled, store, result.handle, tmp_path / "run")
+    assert vars(compiled).get("_artifact_runtime") is None
+
+
+@pytest.mark.parametrize("metadata_kind", ["host", "cluster"])
+def test_c1d2_cold_restore_rejects_metadata_spec_entry_mismatch(tmp_path, metadata_kind):
+    store = ArtifactStore(tmp_path / "cache", private_root=tmp_path / "private")
+    entry_kind = "cluster" if metadata_kind == "host" else "host"
+    spec = ArtifactSpec(
+        ArtifactState.GENERATED,
+        BuildKind.DISTRIBUTED,
+        ("distributed_meta.json", "orchestration/cluster_orch.py"),
+        entry_kind=entry_kind,
+    )
+
+    def build(root):
+        record = _c1d2_cluster_payload(root)
+        if metadata_kind == "host":
+            record.pop("cluster_config")
+            record.update(schema=3, entry_kind="host", distributed_config={})
+            (root / "distributed_meta.json").write_text(json.dumps(record))
+
+    result = store.get_or_build(_key(), spec, build)
+    with pytest.raises(ValueError, match=r"(?i)(entry|cluster|metadata)"):
+        restore_artifact(store, result.handle, tmp_path / "run")
+
+
+@pytest.mark.parametrize("route", ["run", "submit", "register"])
+def test_c1d2_host_worker_rejects_cluster_before_dispatch_state(tmp_path, monkeypatch, route):
+    from pypto.runtime.distributed_runner import DistributedWorker  # noqa: PLC0415
+
+    _c1d2_cluster_payload(tmp_path)
+    compiled = DistributedCompiledProgram.from_dir(tmp_path)
+    # An uninitialized Worker is intentional: entry validation must precede locks,
+    # registrations and all host-only dispatch state, even on a supplied Worker.
+    worker = object.__new__(DistributedWorker)
+    with pytest.raises(NotImplementedError, match=r"(?i)(cluster|L4|POD).*(support|runner|execution)"):
+        getattr(worker, route)(compiled)
+
+
+@pytest.mark.parametrize("bypass", ["source_changed", "extra_changed", "unsupported_packaging"])
+def test_c1d2_private_build_bypass_does_not_seed_stale_object_identity(
+    tmp_path, monkeypatch, fake_runtime, bypass
+):
+    from pypto.jit import _persistent  # noqa: PLC0415
+    from pypto.runtime import _artifact_sources  # noqa: PLC0415
+
+    monkeypatch.setattr(_persistent, "capture_toolchain", lambda *args: _key().environment)
+    extra = tmp_path / "extra.py"
+    extra.write_text("# before compilation\n")
+    config = CacheConfig(enabled=True, root=tmp_path / "cache", readonly=True, extra_source_paths=(extra,))
+    owner = SimpleNamespace(_artifact_objects={})
+    source_state = ["original-source"]
+    built = []
+
+    if bypass == "unsupported_packaging":
+
+        def unsupported(*args, **kwargs):
+            raise UnsupportedArtifactInput("test extern packaging remains private")
+
+        monkeypatch.setattr(_artifact_sources, "package_generated_sources", unsupported)
+
+    def build(*, output_dir):
+        directory = Path(output_dir)
+        _generated(directory, BuildKind.SINGLE_CHIP)
+        result = CompiledProgram.from_dir(directory)
+        built.append(result)
+        if bypass == "source_changed":
+            source_state[0] = "changed-during-compilation"
+        elif bypass == "extra_changed":
+            extra.write_text("# changed during compilation\n")
+        return result
+
+    def request():
+        return _persistent.resolve_persistent(
+            owner,
+            ("same-specialization",),
+            config,
+            build,
+            lambda: digest_record(source_state[0]),
+            platform="a2a3sim",
+            runtime_name="test_runtime",
+            distributed=False,
+        )
+
+    first = request()
+    # Return to the original request identity. A private result produced while
+    # inputs changed must not be reusable under that original compatible key.
+    source_state[0] = "original-source"
+    extra.write_text("# before compilation\n")
+    second = request()
+    assert len(built) == 2
+    assert second is not first
+    assert first._artifact_runtime is None and second._artifact_runtime is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

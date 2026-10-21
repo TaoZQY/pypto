@@ -55,6 +55,33 @@ subsequent private requests build again. This is not a private-object cache.
 
 Current compilers emit `supported_execution_modes: ["program"]` in
 `compiled_meta.json` (schema 2) and `distributed_meta.json` (schema 3).
+HOST artifacts retain schema 3. Cluster metadata uses schema 4, with explicit
+`entry_kind: "cluster"`, the actual post-pass root's `entry_name`, and a strict
+`cluster_config` record. Its signature, outputs and return count belong to the
+highest Orchestrator, even when a HOST dependency sorts before that root.
+SubWorkers do not select the entry; multiple highest cluster roots are rejected.
+Schema 4 rejects missing/unknown fields, malformed node entries and contradictory
+HOST configuration. Schema-3 readers reject schema 4. Cluster config overrides
+must equal the stored snapshot; changing placement requires recompilation.
+
+`ArtifactSpec.entry_kind` distinguishes `chip`, `host` and `cluster`. Existing
+CHIP/HOST defaults retain their spec digests and manifests; cluster specs add
+explicit entry identity and require `orchestration/cluster_orch.py`. Restoration
+checks manifest and metadata entry kinds before loading generated code. Binding
+also checks the root identity, signature and captured cluster configuration.
+The default `entry_kind=None` requests inference from `build_kind`;
+`effective_entry_kind` exposes that result without changing the input, so replacing
+a default spec's build kind re-infers the entry. Explicit contradictory kinds fail.
+Schema-4 metadata is limited to CLUSTER_0; constructing a CLUSTER_1, CLUSTER_2 or
+GLOBAL wrapper raises an unsupported-entry diagnostic before mutating artifacts.
+
+Cluster restoration is metadata-only: it runs no passes, codegen or
+`kernel_config.py`. Full L4 compilation, binary promotion/loading and execution
+remain unsupported until cluster codegen and runner integration exist. The
+wrapper, HOST worker and prebuilt adapter reject L4 before HOST fallback or
+compiler startup. This milestone defines neither recursive CHIP inventory nor
+the final cluster wire ABI.
+
 `ExecutionCapabilities` in `pypto._artifact_contract` is immutable and validated;
 `CompiledProgram`, its orchestration children, and `DistributedCompiledProgram`
 retain it across `from_dir()` without loading binaries or starting workers.

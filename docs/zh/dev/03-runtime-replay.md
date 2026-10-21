@@ -225,3 +225,7 @@ L3 replay 会把 `RunConfig` 中的运行时 DFX 字段透传到每个芯片派�
 `dfx_outputs/rank{r}/d{k}/`；onboard 泳道使用
 [运行时 DFX 开关](03-runtime-dfx.md) 里描述的抓图/计时两趟协议。
 因此「改完再跑」既支持正确性复检，也支持 L3 运行时诊断。
+
+集群 `distributed_meta.json` 使用 schema 4；`from_dir()` 保留实际集群入口身份和
+`ClusterConfig` 快照。该操作仅恢复元数据：调用、准备或提交该对象时，会在使用任何
+HOST runner 或编译器前明确报告 L4 尚未支持。HOST schema 3 回放及已有配置覆盖仍然可用。

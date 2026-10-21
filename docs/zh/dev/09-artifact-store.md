@@ -42,6 +42,27 @@ SHA-256 源码和特化摘要。其记录保留每个环境组件摘要和两个
 
 当前编译器在 `compiled_meta.json`（schema 2）和 `distributed_meta.json`
 （schema 3）中写入 `supported_execution_modes: ["program"]`。
+HOST 产物继续使用 schema 3。集群元数据使用 schema 4，显式记录
+`entry_kind: "cluster"`、实际 pass 后根函数的 `entry_name`，以及严格校验的
+`cluster_config`。签名、输出方向及返回值数量属于最高层 Orchestrator，即使 HOST
+依赖按名称排在根函数前面也一样。SubWorker 不参与入口选择；多个最高层集群根会被拒绝。
+schema 4 拒绝缺失或未知字段、非法节点记录及冲突的 HOST 配置；schema 3 读取器拒绝
+schema 4。显式集群配置覆盖必须等于保存的快照；更换设备分配需要重新编译。
+
+`ArtifactSpec.entry_kind` 区分 `chip`、`host` 和 `cluster`。已有 CHIP/HOST 默认值
+保留原 spec 摘要和 manifest；集群 spec 显式增加入口身份，并要求
+`orchestration/cluster_orch.py`。恢复时在加载生成代码前核对 manifest 和元数据入口类型；
+绑定时还核对根函数身份、签名及捕获的集群配置。
+默认 `entry_kind=None` 表示由 `build_kind` 推断；`effective_entry_kind` 返回推断结果，
+但不改写输入，因此替换默认 spec 的构建类型时会重新推断入口。显式冲突的入口类型会报错。
+schema 4 元数据仅支持 CLUSTER_0；直接构建 CLUSTER_1、CLUSTER_2 或 GLOBAL 包装器时，
+会在修改任何产物前明确报告该入口尚未支持。
+
+集群恢复仅重建元数据，不运行 pass、codegen 或 `kernel_config.py`。在集群 codegen 和
+runner 完成前，完整 L4 编译、二进制晋级/加载及执行仍未支持。包装器、HOST Worker 和
+prebuilt 适配器会在 HOST 回退或编译器启动前拒绝 L4。本阶段不定义递归 CHIP 清单，
+也不预设最终集群 wire ABI。
+
 `pypto._artifact_contract` 中的 `ExecutionCapabilities` 是经过校验的不可变记录；
 `CompiledProgram`、其 orchestration 子对象和 `DistributedCompiledProgram`
 在 `from_dir()` 后保留该记录，无需加载二进制或初始化 Worker。

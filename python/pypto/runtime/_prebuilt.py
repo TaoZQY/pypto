@@ -114,8 +114,25 @@ def write_chip_binaries(
     (directory / BINARY_MANIFEST).write_bytes(encode_manifest(record))
 
 
-def chip_directories(directory: Path, kind: BuildKind) -> dict[str, Path]:
+def _require_supported_directory(directory: Path, validated_entry_kind: str | None = None) -> None:
+    """L4 has no flat HOST/CHIP binary layout until cluster codegen lands."""
+    if validated_entry_kind == "cluster":
+        raise NotImplementedError(
+            "Cluster/POD (L4) compilation/loading is unsupported until cluster runner integration"
+        )
+    if validated_entry_kind in {"host", "chip"}:
+        return
+    if (directory / "distributed_meta.json").is_file():
+        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
+
+        DistributedCompiledProgram.from_dir(directory)._require_supported_execution()
+
+
+def chip_directories(
+    directory: Path, kind: BuildKind, *, _validated_entry_kind: str | None = None
+) -> dict[str, Path]:
     """Enumerate all supported chip sub-builds without executing configuration."""
+    _require_supported_directory(directory, _validated_entry_kind)
     if kind is BuildKind.SINGLE_CHIP:
         if not (directory / "kernel_config.py").is_file():
             raise ValueError(f"Single-chip artifact lacks kernel_config.py: {directory}")
@@ -136,6 +153,7 @@ def chip_directories(directory: Path, kind: BuildKind) -> dict[str, Path]:
 
 def prepare_prebuilt(directory: Path, platform: str, kind: BuildKind) -> None:
     """Finish every chip binary without constructing a device or executing kernels."""
+    _require_supported_directory(directory)
     from .device_runner import _compile_and_assemble  # noqa: PLC0415
 
     chips = chip_directories(directory, kind)
@@ -227,6 +245,7 @@ def ready_spec(directory: Path, generated: ArtifactSpec, *, metadata_only: bool 
         generated.build_kind,
         tuple(sorted(required)),
         generated.execution_capabilities,
+        generated.entry_kind,
     )
 
 
@@ -335,9 +354,10 @@ def read_prebuilt(
     kind: BuildKind,
     *,
     _validated_files: dict[Path, dict[str, Any]] | None = None,
+    _validated_entry_kind: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Read and validate every child before any callable can be assembled."""
-    chips = chip_directories(directory, kind)
+    chips = chip_directories(directory, kind, _validated_entry_kind=_validated_entry_kind)
     if kind is BuildKind.DISTRIBUTED:
         parent = _read_json(directory)
         if (
@@ -372,6 +392,7 @@ def load_prebuilt(
     kind: BuildKind,
     *,
     _validated_files: dict[Path, dict[str, Any]] | None = None,
+    _validated_entry_kind: str | None = None,
 ) -> dict[str, tuple[Any, str, dict[str, Any]]]:
     """Assemble validated bytes without compiler resolution, locks, or filesystem writes.
 
@@ -379,7 +400,15 @@ def load_prebuilt(
     expected key. Its verified inventory can be reused for immutable published
     files. Without it, this helper hashes binaries (including private fallback).
     """
-    records = read_prebuilt(directory, platform, kind, _validated_files=_validated_files)
+    # The artifact adapter has already restored and checked this entry contract.
+    # Reuse it alongside the validated file inventory, without another sidecar read.
+    records = read_prebuilt(
+        directory,
+        platform,
+        kind,
+        _validated_files=_validated_files,
+        _validated_entry_kind=_validated_entry_kind,
+    )
     # Installed READY loading needs native constructors, not Worker setup.
     native = _native_callable_interface()
     ArgDirection = native.ArgDirection

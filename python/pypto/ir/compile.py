@@ -563,10 +563,8 @@ def compile(  # noqa: PLR0913
     # Detect distributed programs: any function with level >= HOST (Linqu level 3).
     # Use the post-pass program so functions promoted to HOST by outlining
     # (e.g. via ``with pl.at(level=pl.Level.HOST, ...)``) are still detected.
-    is_distributed = any(
-        f.level is not None and _ir_core.level_to_linqu_level(f.level) >= 3
-        for f in transformed_program.functions.values()
-    )
+    highest_postpass = _highest_orchestration_level(transformed_program)
+    is_distributed = highest_postpass is not None and _ir_core.level_to_linqu_level(highest_postpass) >= 3
 
     if is_distributed:
         from .distributed_compiled_program import (  # noqa: PLC0415
@@ -574,7 +572,8 @@ def compile(  # noqa: PLR0913
             DistributedConfig,
         )
 
-        if distributed_config is None:
+        is_cluster = highest_postpass is not None and _ir_core.level_to_linqu_level(highest_postpass) >= 4
+        if not is_cluster and distributed_config is None:
             distributed_config = DistributedConfig()
         return DistributedCompiledProgram(
             transformed_program,
@@ -582,6 +581,7 @@ def compile(  # noqa: PLR0913
             backend_type=effective_backend_type,
             platform=platform,
             distributed_config=distributed_config,
+            cluster_config=cluster_config,
         )
 
     # Hand over the layout codegen just produced instead of letting

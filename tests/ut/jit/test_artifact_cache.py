@@ -807,5 +807,67 @@ def test_execution_capabilities_are_canonical_and_immutable():
     )
 
 
+def test_c1d2_cluster_entry_is_part_of_artifact_spec_identity():
+    files = ("distributed_meta.json", "orchestration/cluster_orch.py")
+    host = ArtifactSpec(ArtifactState.GENERATED, BuildKind.DISTRIBUTED, files, entry_kind="host")
+    cluster = ArtifactSpec(ArtifactState.GENERATED, BuildKind.DISTRIBUTED, files, entry_kind="cluster")
+    assert host.digest != cluster.digest
+    assert replace(cluster, state=ArtifactState.BINARY_READY).entry_kind == "cluster"
+
+
+@pytest.mark.parametrize(
+    "kind,entry",
+    [
+        (BuildKind.SINGLE_CHIP, "cluster"),
+        (BuildKind.SINGLE_CHIP, "host"),
+        (BuildKind.DISTRIBUTED, "chip"),
+        (BuildKind.DISTRIBUTED, "pod-maybe"),
+        (BuildKind.DISTRIBUTED, True),
+    ],
+)
+def test_c1d2_artifact_spec_rejects_contradictory_entry_kind(kind, entry):
+    with pytest.raises(ValueError, match=r"(?i)(entry|kind)"):
+        ArtifactSpec(ArtifactState.GENERATED, kind, ("metadata.json",), entry_kind=entry)
+
+
+def test_c1d2_cluster_spec_required_entry_file_is_enforced_by_real_store(store):
+    spec = ArtifactSpec(
+        ArtifactState.GENERATED,
+        BuildKind.DISTRIBUTED,
+        ("distributed_meta.json", "orchestration/cluster_orch.py"),
+        entry_kind="cluster",
+    )
+
+    def wrong_host_payload(directory):
+        (directory / "distributed_meta.json").write_text("{}")
+        (directory / "orchestration").mkdir()
+        (directory / "orchestration/host_orch.py").write_text("# wrong hierarchy entry\n")
+
+    with pytest.raises(ValueError, match=r"cluster_orch\.py"):
+        store.get_or_build(_key(), spec, wrong_host_payload)
+
+
+def test_c1d2_cluster_spec_manifest_preserves_explicit_entry_kind(store):
+    spec = ArtifactSpec(
+        ArtifactState.GENERATED,
+        BuildKind.DISTRIBUTED,
+        ("distributed_meta.json", "orchestration/cluster_orch.py"),
+        entry_kind="cluster",
+    )
+
+    def payload(directory):
+        (directory / "distributed_meta.json").write_text("{}")
+        (directory / "orchestration").mkdir()
+        (directory / "orchestration/cluster_orch.py").write_text("# cluster entry\n")
+
+    built = store.get_or_build(_key(), spec, payload)
+    record = json.loads((built.handle.directory / MANIFEST_NAME).read_text())
+    assert record["entry_kind"] == "cluster"
+    assert store.lookup(_key(), spec).status is LookupStatus.HIT
+    record["entry_kind"] = "host"
+    (built.handle.directory / MANIFEST_NAME).write_text(json.dumps(record))
+    assert store.lookup(_key(), spec).status is LookupStatus.INVALID
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

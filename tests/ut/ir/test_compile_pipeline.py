@@ -328,5 +328,57 @@ def test_c1d1_compile_cluster_config_retains_temporary_pod_guard(tmp_path, monke
     assert not (tmp_path / "pod").exists()
 
 
+@pytest.mark.parametrize("has_config", [False, True])
+def test_c1d2_postpass_cluster_entry_selects_cluster_wrapper_contract(tmp_path, monkeypatch, has_config):
+    import importlib  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from pypto.backend import BackendType  # noqa: PLC0415
+    from pypto.ir import ClusterConfig, ClusterNodeSpec, DistributedCompiledProgram  # noqa: PLC0415
+
+    module = importlib.import_module("pypto.ir.compile")
+    span = ir.Span.unknown()
+    body = ir.SeqStmts([], span)
+    host = ir.Function("host_dep", [], [], body, span, level=ir.Level.HOST, role=ir.Role.Orchestrator)
+    cluster = ir.Function(
+        "cluster_entry", [], [], body, span, level=ir.Level.CLUSTER_0, role=ir.Role.Orchestrator
+    )
+    transformed = ir.Program([host, cluster], "c1d2_postpass", span)
+    monkeypatch.setattr(module, "_check_supported_orchestration_level", lambda *_: None)
+    monkeypatch.setattr(
+        module,
+        "_run_pass_pipeline",
+        lambda *args, **kwargs: SimpleNamespace(
+            transformed_program=transformed,
+            memory_planner=passes.MemoryPlanner.PYPTO,
+            backend_type=BackendType.Ascend910,
+            runtime=passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "generate",
+        lambda *args, **kwargs: {
+            "orchestration/cluster_orch.py": "raise AssertionError('metadata-only fixture')\n",
+        },
+    )
+    kwargs = (
+        {"cluster_config": ClusterConfig([ClusterNodeSpec("node-a")], "/env/bin/python")}
+        if has_config
+        else {}
+    )
+    if not has_config:
+        with pytest.raises(ValueError, match=r"(?i)(cluster_config|ClusterConfig)"):
+            module.compile(transformed, output_dir=str(tmp_path), skip_ptoas=True, **kwargs)
+    else:
+        compiled = module.compile(transformed, output_dir=str(tmp_path), skip_ptoas=True, **kwargs)
+        assert isinstance(compiled, DistributedCompiledProgram)
+        assert compiled.program is transformed
+        assert compiled.entry_kind == "cluster" and compiled.entry_name == "cluster_entry"
+        assert compiled.cluster_config == kwargs["cluster_config"]
+        record = json.loads((tmp_path / "distributed_meta.json").read_text())
+        assert record["schema"] == 4 and record["entry_name"] == "cluster_entry"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

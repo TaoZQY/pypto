@@ -248,3 +248,9 @@ dispatch. Artifacts are written under
 `dfx_outputs/rank{r}/d{k}/`; onboard swimlane uses the graph/timing two-pass
 protocol described in [Runtime DFX Flags](03-runtime-dfx.md). The edit-and-rerun loop therefore supports both
 correctness re-checks and L3 runtime diagnostics.
+
+Cluster `distributed_meta.json` records use schema 4 and retain their actual
+cluster entry identity and `ClusterConfig` snapshot through `from_dir()`.
+This is metadata restoration only: calling, preparing or submitting that object
+raises an unsupported-L4 diagnostic before any HOST runner or compiler is used.
+HOST schema-3 replay and its existing configuration overrides remain supported.

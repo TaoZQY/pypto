@@ -1458,8 +1458,9 @@ def test_c1d1_cluster_key_rejects_distributed_config_conflict():
         )
 
 
-def test_c1d1_actual_pod_jit_forwards_cluster_config_and_caches_by_value(monkeypatch):
+def test_c1d1_actual_pod_jit_forwards_cluster_config_and_caches_by_value(monkeypatch, tmp_path):
     from pypto import CacheConfig  # noqa: PLC0415
+    from pypto.ir import DistributedCompiledProgram  # noqa: PLC0415
     from pypto.jit.cache import (  # noqa: PLC0415
         _freeze,
     )
@@ -1477,17 +1478,23 @@ def test_c1d1_actual_pod_jit_forwards_cluster_config_and_caches_by_value(monkeyp
         assert next(iter(program.functions.values())).level == pl.Level.CLUSTER_0
         snapshot = _freeze(kwargs["cluster_config"])
 
-        def execute(*args, **run_kwargs):
-            dispatched.append((snapshot, args, run_kwargs))
-            return snapshot
-
         built.append(snapshot)
-        return execute
+        directory = tmp_path / f"compiled-{len(built)}"
+        directory.mkdir()
+        return DistributedCompiledProgram(program, str(directory), cluster_config=kwargs["cluster_config"])
+
+    def execute(compiled, *args, **run_kwargs):
+        # Keep the old forwarding test at its intended dispatch boundary while
+        # supplying the real L4 identity contract now required by the JIT.
+        snapshot = _freeze(compiled.cluster_config)
+        dispatched.append((snapshot, args, run_kwargs))
+        return snapshot
 
     # Only bypass C1c's temporary full-program guard; specialization, keying,
     # compile forwarding, and __call__ dispatch remain the real public path.
     monkeypatch.setattr(decorator, "_check_supported_orchestration_level", lambda level: None)
     monkeypatch.setattr(compiler, "compile", compile_program)
+    monkeypatch.setattr(DistributedCompiledProgram, "__call__", execute)
     cluster = _c1d1_cluster_config()
     config = RunConfig(cluster_config=cluster, cache_config=CacheConfig(enabled=False))
     import torch  # noqa: PLC0415
@@ -1505,8 +1512,9 @@ def test_c1d1_actual_pod_jit_forwards_cluster_config_and_caches_by_value(monkeyp
     assert dispatched[0][2]["config"] is config
 
 
-def test_c1d1_pod_compile_and_key_share_cluster_snapshot(monkeypatch):
+def test_c1d1_pod_compile_and_key_share_cluster_snapshot(monkeypatch, tmp_path):
     from pypto import CacheConfig  # noqa: PLC0415
+    from pypto.ir import DistributedCompiledProgram  # noqa: PLC0415
     from pypto.jit.cache import (  # noqa: PLC0415
         _freeze,
     )
@@ -1530,7 +1538,7 @@ def test_c1d1_pod_compile_and_key_share_cluster_snapshot(monkeypatch):
 
     def compile_program(program, **kwargs):
         compiled_configs.append(_freeze(kwargs["cluster_config"]))
-        return program
+        return DistributedCompiledProgram(program, str(tmp_path), cluster_config=kwargs["cluster_config"])
 
     monkeypatch.setattr(decorator, "_check_supported_orchestration_level", lambda level: None)
     monkeypatch.setattr(decorator, "make_cache_key", mutate_after_key)

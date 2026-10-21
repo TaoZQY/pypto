@@ -1448,6 +1448,34 @@ def test_c1c_persistent_identity_receives_distributed_flag(monkeypatch, tmp_path
     calls = []
     selected_specs = []
     artifact = object()
+    if func_type == "pod":
+        import json  # noqa: PLC0415
+
+        from pypto.ir import DistributedCompiledProgram  # noqa: PLC0415
+
+        # POD now has a strict metadata contract rather than a HOST-shaped
+        # placeholder. Keep this old routing test behind its unit-only guard.
+        directory = tmp_path / "pod-artifact"
+        directory.mkdir()
+        (directory / "distributed_meta.json").write_text(
+            json.dumps(
+                {
+                    "schema": 4,
+                    "entry_kind": "cluster",
+                    "entry_name": "entry",
+                    "supported_execution_modes": ["program"],
+                    "params": [],
+                    "num_return_types": 0,
+                    "platform": "a2a3sim",
+                    "backend_type": "Ascend910",
+                    "cluster_config": {
+                        "nodes": [{"host": "node-a", "devices": [2]}],
+                        "python_executable": "/env/bin/python",
+                    },
+                }
+            )
+        )
+        artifact = DistributedCompiledProgram.from_dir(directory)
     handle = object()
     identity = ToolchainIdentity(
         *(digest_record(name) for name in ("pypto", "runtime", "isa", "ptoas", "cxx"))
@@ -1461,6 +1489,8 @@ def test_c1c_persistent_identity_receives_distributed_flag(monkeypatch, tmp_path
         def lookup_ready(self, key, spec):
             selected_specs.append((key, spec))
             return ArtifactLookup(LookupStatus.HIT, handle=handle)
+
+        lookup = lookup_ready
 
     monkeypatch.setattr(_persistent, "JITArtifactStore", ColdStore)
 
@@ -1478,7 +1508,12 @@ def test_c1c_persistent_identity_receives_distributed_flag(monkeypatch, tmp_path
     monkeypatch.setattr(_persistent, "resolve_persistent", resolve)
     result, _, _ = wrapped._resolve_compiled(
         (),
-        {"config": RunConfig(cache_config=CacheConfig(enabled=True, root=tmp_path))},
+        {
+            "config": RunConfig(
+                cache_config=CacheConfig(enabled=True, root=tmp_path),
+                cluster_config=_c1d2_launch_config() if func_type == "pod" else None,
+            )
+        },
         allow_signature_mode=True,
     )
     assert result is artifact
@@ -1569,6 +1604,207 @@ class P:
     ):
         compile_module.compile(program, output_dir=str(tmp_path / "output"), skip_ptoas=True)
     assert not (tmp_path / "output").exists()
+
+
+def _c1d2_launch_config():
+    from pypto.ir import ClusterConfig, ClusterNodeSpec  # noqa: PLC0415
+
+    return ClusterConfig([ClusterNodeSpec("node-a", [2])], "/env/bin/python")
+
+
+def _c1d2_identity_guard_fixture(monkeypatch):
+    # Only metadata identity tests cross this temporary stage boundary. Public
+    # compile/call tests above continue exercising the real C1c stage guard.
+    for name in ("pypto.ir.compile", "pypto.jit.decorator"):
+        monkeypatch.setattr(
+            importlib.import_module(name), "_check_supported_orchestration_level", lambda *_: None
+        )
+
+
+def _c1d2_cold_cluster_slot(monkeypatch):
+    """Seed an actual ArtifactStore slot once its full JIT request key is known."""
+    import json  # noqa: PLC0415
+
+    from pypto._identity import ToolchainIdentity, digest_record  # noqa: PLC0415
+    from pypto.jit import _persistent  # noqa: PLC0415
+    from pypto.jit._artifact_manifest import (  # noqa: PLC0415
+        MANIFEST_NAME,
+        ArtifactState,
+        BuildKind,
+        encode_manifest,
+        make_manifest,
+    )
+
+    identity = ToolchainIdentity(
+        *(digest_record(name) for name in ("pypto", "runtime", "isa", "ptoas", "cxx"))
+    )
+    monkeypatch.setattr(_persistent, "capture_toolchain", lambda *_: identity)
+    original_lookup = _persistent.JITArtifactStore.lookup
+    visited = []
+
+    def seed_then_lookup(store, key, spec):
+        assert spec.build_kind is BuildKind.DISTRIBUTED
+        assert spec.entry_kind == "cluster"
+        assert "orchestration/cluster_orch.py" in spec.required_files
+        assert "orchestration/host_orch.py" not in spec.required_files
+        visited.append(spec)
+        directory = store._slot(key, spec)
+        if spec.state is ArtifactState.GENERATED and not directory.exists():
+            directory.mkdir(parents=True)
+            record = {
+                "schema": 4,
+                "entry_kind": "cluster",
+                "entry_name": "cluster_root",
+                "supported_execution_modes": ["program"],
+                "params": [],
+                "num_return_types": 0,
+                "platform": "a2a3sim",
+                "backend_type": "Ascend910",
+                "cluster_config": {
+                    "nodes": [{"host": "node-a", "devices": [2]}],
+                    "python_executable": "/env/bin/python",
+                },
+            }
+            (directory / "distributed_meta.json").write_text(json.dumps(record))
+            (directory / "orchestration").mkdir()
+            (directory / "orchestration/cluster_orch.py").write_text(
+                "raise AssertionError('must not import cluster generated entry')\n"
+            )
+            (directory / MANIFEST_NAME).write_bytes(encode_manifest(make_manifest(directory, key, spec)))
+        return original_lookup(store, key, spec)
+
+    monkeypatch.setattr(_persistent.JITArtifactStore, "lookup", seed_then_lookup)
+    return visited
+
+
+@pytest.mark.parametrize("entry_surface", ["pod", "regular_nested"])
+def test_c1d2_configured_cluster_real_cold_and_object_route(monkeypatch, tmp_path, entry_surface):
+    from pypto.ir import DistributedCompiledProgram  # noqa: PLC0415
+
+    _c1d2_identity_guard_fixture(monkeypatch)
+    visited = _c1d2_cold_cluster_slot(monkeypatch)
+
+    @jit.pod
+    def pod():
+        pass
+
+    @jit
+    def regular_nested():
+        with pl.at(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator):
+            pass
+
+    entry = pod if entry_surface == "pod" else regular_nested
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("a real cold cluster artifact hit entered specialization, passes, or codegen")
+
+    monkeypatch.setattr(entry, "_compile", forbidden)
+    config = RunConfig(
+        cluster_config=_c1d2_launch_config(), cache_config=CacheConfig(enabled=True, root=tmp_path / "cache")
+    )
+    restored = entry.compile(config=config)
+    assert isinstance(restored, DistributedCompiledProgram)
+    assert restored.entry_kind == "cluster" and restored.program is None
+    assert restored.cluster_config == _c1d2_launch_config()
+    assert visited
+    lookups = len(visited)
+    assert entry.compile(config=config) is restored
+    assert len(visited) == lookups
+
+
+@pytest.mark.parametrize("cache_enabled", [False, True])
+def test_c1d2_cluster_object_hit_rejects_host_contract(monkeypatch, tmp_path, cache_enabled):
+    import json  # noqa: PLC0415
+
+    from pypto.ir import DistributedCompiledProgram  # noqa: PLC0415
+
+    _c1d2_identity_guard_fixture(monkeypatch)
+    _c1d2_cold_cluster_slot(monkeypatch)
+
+    @jit.pod
+    def pod():
+        pass
+
+    host = tmp_path / "host"
+    host.mkdir()
+    (host / "distributed_meta.json").write_text(
+        json.dumps(
+            {
+                "schema": 3,
+                "params": [],
+                "num_return_types": 0,
+                "supported_execution_modes": ["program"],
+                "platform": "a2a3sim",
+                "backend_type": "Ascend910",
+                "distributed_config": {},
+            }
+        )
+    )
+    host_compiled = DistributedCompiledProgram.from_dir(host)
+    config = RunConfig(
+        cluster_config=_c1d2_launch_config(),
+        cache_config=CacheConfig(enabled=cache_enabled, root=tmp_path / "cache"),
+    )
+    if cache_enabled:
+        pod.compile(config=config)
+        for key in pod._artifact_objects:
+            pod._artifact_objects[key] = host_compiled
+    else:
+        monkeypatch.setattr(pod, "_compile", lambda *args, **kwargs: host_compiled)
+    with pytest.raises(ValueError, match=r"(?i)(cluster|entry|config)"):
+        pod.compile(config=config)
+
+
+def test_c1d2_pod_missing_config_never_consults_cold_store(monkeypatch, tmp_path):
+    from pypto.jit import _persistent  # noqa: PLC0415
+
+    _c1d2_identity_guard_fixture(monkeypatch)
+
+    @jit.pod
+    def pod():
+        pass
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("POD without ClusterConfig reached cache lookup or compilation")
+
+    monkeypatch.setattr(_persistent, "resolve_persistent", forbidden)
+    monkeypatch.setattr(pod, "_compile", forbidden)
+    with pytest.raises(ValueError, match=r"(?i)(cluster_config|ClusterConfig)"):
+        pod.compile(config=RunConfig(cache_config=CacheConfig(enabled=True, root=tmp_path)))
+
+
+def test_c1d2_regular_nested_host_object_hit_keeps_default_distributed_contract(monkeypatch, tmp_path):
+    from pypto.ir import DistributedCompiledProgram, DistributedConfig  # noqa: PLC0415
+
+    @jit
+    def nested_host(x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]):
+        with pl.at(level=pl.Level.HOST, role=pl.Role.Orchestrator):
+            # A real CHIP dispatch survives optimization; a pure alias in the
+            # HOST scope disappears before outlining and is not a HOST program.
+            with pl.at(level=pl.Level.CHIP, role=pl.Role.Orchestrator):
+                out = _add_incore(x, x, out)
+        return out
+
+    # Ordinary JIT currently declares CHIP and its outlining pass does not
+    # retain upward HOST scopes. Supply real supported post-pass HOST IR at
+    # the compile boundary: cache selection must preserve the returned kind.
+    span = ir.Span.unknown()
+    host = ir.Function(
+        "host_root", [], [], ir.SeqStmts([], span), span, level=ir.Level.HOST, role=ir.Role.Orchestrator
+    )
+    actual = DistributedCompiledProgram(ir.Program([host], "ActualHost", span), str(tmp_path))
+    monkeypatch.setattr(nested_host, "_compile", lambda *args, **kwargs: actual)
+    compiled = nested_host.compile()
+    assert isinstance(compiled, DistributedCompiledProgram)
+    assert compiled.entry_kind == "host"
+    assert compiled._distributed_config == DistributedConfig()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("ordinary warm JIT hit reparsed or recompiled the IR")
+
+    monkeypatch.setattr(nested_host, "_compile", forbidden)
+    monkeypatch.setattr(nested_host, "_compile_to_program", forbidden)
+    assert nested_host.compile() is compiled
 
 
 if __name__ == "__main__":
