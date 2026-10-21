@@ -21,6 +21,7 @@ import warnings
 
 import pypto.language as pl
 import pytest
+from pypto._cache_config import CacheConfig
 from pypto.backend import BackendType
 from pypto.compile_profiling import CompileProfiler
 from pypto.ir import OptimizationStrategy, PassDumpLevel
@@ -1418,6 +1419,156 @@ def test_deprecated_and_explicit_target_share_cache(kernel, compile_calls, platf
         assert kernel.compile(config=legacy) is artifact
     assert len(compile_calls) == 1
     assert next(iter(kernel._cache)).platform == platform
+
+
+@pytest.mark.parametrize("func_type", ["pod", "host", "incore"])
+def test_c1c_persistent_identity_receives_distributed_flag(monkeypatch, tmp_path, func_type):
+    """Check real cold-route selection independently of the temporary L4 stage guard."""
+    from pypto._identity import ToolchainIdentity, digest_record  # noqa: PLC0415
+    from pypto.jit import _persistent  # noqa: PLC0415
+    from pypto.jit._artifact_manifest import BuildKind  # noqa: PLC0415
+    from pypto.jit.artifact_cache import ArtifactLookup, LookupStatus  # noqa: PLC0415
+    from pypto.jit.decorator import JITFunction  # noqa: PLC0415
+    from pypto.runtime import _artifact_runtime  # noqa: PLC0415
+
+    compile_module = importlib.import_module("pypto.ir.compile")
+    decorator_module = importlib.import_module("pypto.jit.decorator")
+    # C3 will enable this path. The real public guard has separate cold/warm tests below.
+    monkeypatch.setattr(
+        compile_module, "_check_supported_orchestration_level", lambda *_: None, raising=False
+    )
+    monkeypatch.setattr(
+        decorator_module, "_check_supported_orchestration_level", lambda *_: None, raising=False
+    )
+
+    def entry(x: pl.Tensor[[32], pl.FP32]):
+        return x
+
+    wrapped = JITFunction(entry, func_type=func_type)
+    calls = []
+    selected_specs = []
+    artifact = object()
+    handle = object()
+    identity = ToolchainIdentity(
+        *(digest_record(name) for name in ("pypto", "runtime", "isa", "ptoas", "cxx"))
+    )
+    monkeypatch.setattr(_persistent, "capture_toolchain", lambda *_: identity)
+
+    class ColdStore:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def lookup_ready(self, key, spec):
+            selected_specs.append((key, spec))
+            return ArtifactLookup(LookupStatus.HIT, handle=handle)
+
+    monkeypatch.setattr(_persistent, "JITArtifactStore", ColdStore)
+
+    def restore(store, selected, directory, **kwargs):
+        assert selected is handle
+        return artifact
+
+    monkeypatch.setattr(_artifact_runtime, "restore_artifact", restore)
+    real_resolve = _persistent.resolve_persistent
+
+    def resolve(owner, key, config, build, source, **kwargs):
+        calls.append((owner, key, config, source(), kwargs))
+        return real_resolve(owner, key, config, build, source, **kwargs)
+
+    monkeypatch.setattr(_persistent, "resolve_persistent", resolve)
+    result, _, _ = wrapped._resolve_compiled(
+        (),
+        {"config": RunConfig(cache_config=CacheConfig(enabled=True, root=tmp_path))},
+        allow_signature_mode=True,
+    )
+    assert result is artifact
+    assert len(calls) == 1
+    assert calls[0][0] is wrapped
+    assert calls[0][3] == wrapped._persistent_source_digest()
+    assert calls[0][4]["distributed"] is (func_type in {"host", "pod"})
+    assert len(selected_specs) == 1
+    spec = selected_specs[0][1]
+    assert spec.build_kind is (
+        BuildKind.DISTRIBUTED if func_type in {"host", "pod"} else BuildKind.SINGLE_CHIP
+    )
+    assert ("distributed_meta.json" in spec.required_files) is (func_type in {"host", "pod"})
+
+
+@pytest.mark.parametrize("route", ["compile", "call"])
+@pytest.mark.parametrize("cache_state", ["disabled", "cold", "object"])
+def test_c1c_public_pod_compile_rejects_unsupported_stage_before_cache(
+    monkeypatch, tmp_path, route, cache_state
+):
+    from pypto.jit import _persistent  # noqa: PLC0415
+
+    @jit.pod
+    def pod(x: pl.Tensor[[32], pl.FP32]):
+        return x
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("unsupported POD compilation entered cache restore, codegen or execution")
+
+    monkeypatch.setattr(_persistent, "resolve_persistent", forbidden)
+    monkeypatch.setattr(pod, "_compile", forbidden)
+    if cache_state == "object":
+        # A previously cached HOST executable must never become a POD executable.
+        class HostArtifact:
+            __call__ = forbidden
+
+        artifact = HostArtifact()
+        pod._artifact_objects["stale-host"] = artifact
+        monkeypatch.setattr(
+            importlib.import_module("pypto.jit.decorator"), "make_cache_key", lambda **_: "key"
+        )
+        pod._cache["key"] = artifact
+    config = RunConfig(cache_config=CacheConfig(enabled=cache_state == "cold", root=tmp_path))
+    with pytest.raises(
+        NotImplementedError, match=r"(?i)(POD|CLUSTER_0|L4).*(compile|runner|codegen|support)"
+    ):
+        if route == "compile":
+            pod.compile(config=config)
+        else:
+            torch = pytest.importorskip("torch")
+            pod(torch.empty(32), config=config)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_c1c_ir_compile_rejects_highest_cluster_level_before_pipeline(monkeypatch, tmp_path, nested):
+    compile_module = importlib.import_module("pypto.ir.compile")
+    if nested:
+        source = """
+import pypto.language as pl
+@pl.program
+class P:
+    @pl.function
+    def main(self, x: pl.Tensor[[32], pl.FP32]):
+        with pl.at(level=pl.Level.HOST, role=pl.Role.Orchestrator):
+            with pl.at(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator):
+                y = x
+        return y
+"""
+    else:
+        source = """
+import pypto.language as pl
+@pl.program
+class P:
+    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+    def main(self, x: pl.Tensor[[32], pl.FP32]):
+        return x
+"""
+    program = pl.parse_program(source)
+    ir.assert_structural_equal(ir.deserialize(ir.serialize(program)), program)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("L4 public compilation initialized backend or entered the pipeline")
+
+    monkeypatch.setattr(compile_module, "generate", forbidden)
+    monkeypatch.setattr(compile_module, "_resolve_target", forbidden)
+    with pytest.raises(
+        NotImplementedError, match=r"(?i)(POD|CLUSTER_0|L4).*(compile|runner|codegen|support)"
+    ):
+        compile_module.compile(program, output_dir=str(tmp_path / "output"), skip_ptoas=True)
+    assert not (tmp_path / "output").exists()
 
 
 if __name__ == "__main__":

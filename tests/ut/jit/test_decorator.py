@@ -4488,5 +4488,221 @@ class TestRuntimeSizedLocalExtents:
         assert not dim.synthesized
 
 
+@pytest.mark.parametrize("form", ["bare", "parens", "manual"])
+def test_c1c_pod_decoration_forms(form):
+    def pod(a: pl.Tensor[[32], pl.FP32]):
+        return a
+
+    decorator = jit.pod if form == "bare" else jit.pod() if form == "parens" else jit.pod(auto_scope=False)
+    wrapped = decorator(pod)
+    assert pl.jit is jit
+    assert pl.jit.pod is jit.pod
+    assert isinstance(wrapped, JITFunction)
+    assert wrapped.__name__ == "pod"
+    assert wrapped._func_type == "pod"
+    assert wrapped._auto_scope is (form != "manual")
+
+
+@pytest.mark.parametrize("level", [pl.Level.CLUSTER_0, pl.Level.HOST, pl.Level.CHIP])
+def test_c1c_pod_rejects_level_override(level):
+    with pytest.raises(TypeError, match=r"jit\.pod.*does not accept a level="):
+        jit.pod(level=level)
+
+
+def _c1c_four_level_graph():
+    @jit.incore
+    def kernel(x: pl.Tensor[[32], pl.FP32], out: pl.Out[pl.Tensor[[32], pl.FP32]], n: pl.Scalar[pl.INT32]):
+        pl.store(pl.load(x, [0], [32]), [0], out)
+        return out, n
+
+    kernel_alias = kernel
+
+    @jit
+    def chip(x: pl.Tensor[[32], pl.FP32], out: pl.Out[pl.Tensor[[32], pl.FP32]], n: pl.Scalar[pl.INT32]):
+        out, n = kernel_alias(x, out, n)
+        return out, n
+
+    chip_alias = chip
+
+    @jit.host
+    def host(x: pl.Tensor[[32], pl.FP32], out: pl.Out[pl.Tensor[[32], pl.FP32]], n: pl.Scalar[pl.INT32]):
+        out, n = chip_alias(x, out, n, worker=1)
+        return out, n
+
+    host_alias = host
+
+    @jit.pod
+    def pod(x: pl.Tensor[[32], pl.FP32], out: pl.Out[pl.Tensor[[32], pl.FP32]], n: pl.Scalar[pl.INT32]):
+        out, n = host_alias(x, out, n, worker=0)
+        return out, n
+
+    return pod, host, chip, kernel
+
+
+def test_c1c_pod_discovers_complete_aliased_graph():
+    pod, host, chip, kernel = _c1c_four_level_graph()
+    graph = pod._get_dep_graph()
+    assert list(graph.deps) == [kernel, chip, host]
+    assert graph.callees[id(pod._func)] == ["host_alias"]
+    assert graph.callees[id(host._func)] == ["chip_alias"]
+    assert graph.callees[id(chip._func)] == ["kernel_alias"]
+
+
+def test_c1c_four_level_specialize_parse_serialize_roundtrip():
+    pod, _, _, _ = _c1c_four_level_graph()
+    program = pod.specialize()
+    source = program.as_python()
+    assert "pl.Level.CLUSTER_0" in source
+    assert "pl.Level.HOST" in source
+    assert "worker=0" in source or '"worker": 0' in source
+    assert "worker=1" in source or '"worker": 1' in source
+    assert "device=" not in source
+    assert "self.host(" in source and "self.chip(" in source and "self.kernel(" in source
+    assert program.get_function("pod").level == pl.Level.CLUSTER_0
+    assert program.get_function("pod").role == pl.Role.Orchestrator
+    assert program.get_function("host").level == pl.Level.HOST
+    assert program.get_function("chip").level == pl.Level.CHIP
+    ir.assert_structural_equal(pl.parse_program(source), program)
+    ir.assert_structural_equal(ir.deserialize(ir.serialize(program)), program)
+
+
+@pytest.mark.parametrize(
+    ("caller_kind", "callee_kind", "caller_level", "callee_level"),
+    [
+        ("pod", "orchestration", "CLUSTER_0", "CHIP"),
+        ("pod", "pod", "CLUSTER_0", "CLUSTER_0"),
+        ("host", "pod", "HOST", "CLUSTER_0"),
+        ("host", "host", "HOST", "HOST"),
+        ("orchestration", "host", "CHIP", "HOST"),
+        ("orchestration", "pod", "CHIP", "CLUSTER_0"),
+    ],
+)
+def test_c1c_invalid_orchestrator_dependency_edges(caller_kind, callee_kind, caller_level, callee_level):
+    def child(x: pl.Tensor[[32], pl.FP32]):
+        return x
+
+    child = JITFunction(child, func_type=callee_kind)
+
+    def parent(x: pl.Tensor[[32], pl.FP32]):
+        return child(x, worker=0)
+
+    parent = JITFunction(parent, func_type=caller_kind)
+    with pytest.raises(ValueError) as caught:
+        parent._get_deps()
+    message = str(caught.value)
+    assert "parent" in message and "child" in message
+    assert caller_level in message and callee_level in message
+    assert re.search(r"dispatch|orchestrat", message, re.IGNORECASE)
+
+
+@pytest.mark.parametrize("helper_kind", ["incore", "inline", "opaque", "graph"])
+def test_c1c_pod_preserves_helper_dependency_discovery(helper_kind):
+    def helper(x: pl.Tensor[[32], pl.FP32]):
+        return x
+
+    helper = JITFunction(helper, func_type=helper_kind)
+
+    @jit.pod
+    def pod(x: pl.Tensor[[32], pl.FP32]):
+        return helper(x)
+
+    assert pod._get_deps() == [helper]
+
+
+@pytest.mark.parametrize("digest_method", ["_get_source_hash", "_persistent_source_digest"])
+@pytest.mark.parametrize("changed_level", ["host", "chip", "kernel"])
+def test_c1c_pod_graph_identity_refreshes_rebound_dependencies(digest_method, changed_level):
+    @jit.incore
+    def kernel_v1(x: pl.Tensor[[32], pl.FP32]):
+        return x
+
+    @jit.incore
+    def kernel_v2(x: pl.Tensor[[32], pl.FP32]):
+        return x, x
+
+    kernel_binding = kernel_v1
+
+    @jit
+    def chip_v1(x: pl.Tensor[[32], pl.FP32]):
+        return kernel_binding(x)
+
+    @jit(auto_scope=False)
+    def chip_v2(x: pl.Tensor[[32], pl.FP32]):
+        return kernel_binding(x)
+
+    chip_binding = chip_v1
+
+    @jit.host
+    def host_v1(x: pl.Tensor[[32], pl.FP32]):
+        return chip_binding(x, worker=0)
+
+    @jit.host(auto_scope=False)
+    def host_v2(x: pl.Tensor[[32], pl.FP32]):
+        return chip_binding(x, worker=0)
+
+    host_binding = host_v1
+
+    @jit.pod
+    def pod(x: pl.Tensor[[32], pl.FP32]):
+        return host_binding(x, worker=0)
+
+    before = getattr(pod, digest_method)()
+    if changed_level == "kernel":
+        kernel_binding = kernel_v2
+    elif changed_level == "chip":
+        chip_binding = chip_v2
+    else:
+        host_binding = host_v2
+    assert getattr(pod, digest_method)() != before
+    assert {dep.__name__ for dep in pod._get_dep_graph().deps} == {
+        "kernel_v2" if changed_level == "kernel" else "kernel_v1",
+        "chip_v2" if changed_level == "chip" else "chip_v1",
+        "host_v2" if changed_level == "host" else "host_v1",
+    }
+
+
+@pytest.mark.parametrize("digest_method", ["_get_source_hash", "_persistent_source_digest"])
+def test_c1c_pod_identity_includes_entry_kind_and_auto_scope(digest_method):
+    def entry(x: pl.Tensor[[32], pl.FP32]):
+        return x
+
+    variants = [
+        JITFunction(entry, func_type="pod"),
+        JITFunction(entry, func_type="pod", auto_scope=False),
+        JITFunction(entry, func_type="host"),
+        JITFunction(entry, func_type="orchestration"),
+    ]
+    assert len({getattr(fn, digest_method)() for fn in variants}) == len(variants)
+
+
+@pytest.mark.parametrize("digest_method", ["_get_source_hash", "_persistent_source_digest"])
+@pytest.mark.parametrize("changed_metadata", ["host_auto_scope", "kernel_level"])
+def test_c1c_pod_identity_refreshes_same_function_dependency_metadata(digest_method, changed_metadata):
+    def kernel_body(x: pl.Tensor[[32], pl.FP32]):
+        return x
+
+    kernel_binding = JITFunction(kernel_body, func_type="incore", level=pl.Level.AIC)
+
+    @jit
+    def chip(x: pl.Tensor[[32], pl.FP32]):
+        return kernel_binding(x)
+
+    def host_body(x: pl.Tensor[[32], pl.FP32]):
+        return chip(x, worker=0)
+
+    host_binding = jit.host(host_body)
+
+    @jit.pod
+    def pod(x: pl.Tensor[[32], pl.FP32]):
+        return host_binding(x, worker=0)
+
+    before = getattr(pod, digest_method)()
+    if changed_metadata == "host_auto_scope":
+        host_binding = jit.host(auto_scope=False)(host_body)
+    else:
+        kernel_binding = JITFunction(kernel_body, func_type="incore", level=pl.Level.AIV)
+    assert getattr(pod, digest_method)() != before
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

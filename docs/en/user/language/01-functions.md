@@ -62,12 +62,12 @@ To read the IR this becomes, call `entry.lower(*args)` for the post-pass `ir.Pro
 
 ### The `@pl.jit` family
 
-Five variants, one per IR function kind, so a single program can span host, chip, and
-core levels:
+The decorator family maps functions onto pod, host, chip, and core levels:
 
 | Decorator | IR target | Use for |
 | --------- | --------- | ------- |
 | `@pl.jit` | `Orchestration` | Chip-level entry point that dispatches InCore work |
+| `@pl.jit.pod` | `level=CLUSTER_0, role=Orchestrator` | POD frontend entry that dispatches HOST orchestrators; full compilation and execution are not yet supported |
 | `@pl.jit.host` | `level=HOST, role=Orchestrator` | HOST entry — allocates window buffers, dispatches chip orchestrators per rank |
 | `@pl.jit.incore` | `InCore` | A device kernel (accepts `level=` to target a specific hierarchy level) |
 | `@pl.jit.inline` | `Inline` | Helper spliced into every call site by `InlineFunctions` |
@@ -103,7 +103,11 @@ modules each defining `helper`, or two kernels from one factory — the second o
 is suffixed (`helper`, `helper__2`), so both specializations survive; the entry keeps its
 own name. A `@pl.jit.host` entry additionally discovers
 `@pl.jit` chip-orchestration dependencies, so a full distributed program needs no
-`@pl.program` class.
+`@pl.program` class. A `@pl.jit.pod` entry discovers `.host` dependencies and their
+transitive chip and kernel dependencies. Orchestrator dispatch follows
+`pod -> host -> chip`; skipped levels, upward calls and same-level HOST/POD calls
+raise an error naming both functions and levels. Existing helper dependencies
+remain available at every level.
 
 The fragment below shows only the discovery structure — the kernel bodies are elided, and
 the distributed types it names are covered in the distributed chapter, which is not
@@ -132,11 +136,19 @@ def host_orch(
     return outputs
 ```
 
-Plain `@pl.jit` entries do **not** discover other `@pl.jit` entries — only `.host`
-reaches across the chip boundary. That keeps two unrelated top-level kernels from
+Plain `@pl.jit` entries do **not** discover other `@pl.jit` entries. That keeps two unrelated top-level kernels from
 silently folding into one program.
 
-`@pl.jit.host` rejects `level=` (HOST is implicit).
+`@pl.jit.host` and `@pl.jit.pod` reject `level=` because their levels are fixed.
+Both accept the bare form, empty parentheses, and `auto_scope=False`.
+
+POD specialization uses the existing `Function` IR node with canonical
+`level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator`. You can use
+`pod_entry.specialize()`, print/parse its source, and serialize its IR. Full
+`compile()` and execution raise `NotImplementedError` until cluster codegen and
+runner integration are available; a cached HOST executable cannot enable a POD
+entry. Direct `ir.compile(program)` also rejects explicit or nested L4
+orchestration before initializing a backend.
 
 ### What a sub-function hands back keeps its shape and dtype
 

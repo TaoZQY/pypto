@@ -2239,5 +2239,25 @@ class TestRenamedGeneratedFunction:
             specialize("_T", [ctx])
 
 
+@pytest.mark.parametrize("auto_scope", [True, False])
+def test_c1c_pod_specializer_emits_canonical_cluster_orchestrator(auto_scope):
+    context = _make_ctx(
+        source="def kernel(x: pl.Tensor):\n    return x\n",
+        func_type="pod",
+        param_names=["x"],
+        tensor_meta={"x": TensorMeta((32,), DataType.FP32)},
+        auto_scope=auto_scope,
+    )
+    source = specialize("PodProgram", [context])
+    suffix = "" if auto_scope else ", auto_scope=False"
+    assert f"@pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator{suffix})" in source
+    assert "pl.Level.POD" not in source
+    program = pl.parse_program(source)
+    function = program.get_function("kernel")
+    assert function.level == pl.Level.CLUSTER_0
+    assert function.role == pl.Role.Orchestrator
+    ir.assert_structural_equal(ir.deserialize(ir.serialize(program)), program)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

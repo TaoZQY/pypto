@@ -49,11 +49,12 @@ def entry(
 
 ### `@pl.jit` 家族
 
-五个变体，一个对应一种 IR 函数类别，让单个程序可以横跨 host、chip、core 三级：
+装饰器家族将函数映射到 pod、host、chip 和 core 层级：
 
 | 装饰器 | IR 目标 | 用于 |
 | ------ | ------- | ---- |
 | `@pl.jit` | `Orchestration` | chip 级入口，派发 InCore 工作 |
+| `@pl.jit.pod` | `level=CLUSTER_0, role=Orchestrator` | 派发 HOST 编排器的 POD 前端入口；暂不支持完整编译和执行 |
 | `@pl.jit.host` | `level=HOST, role=Orchestrator` | HOST 级入口 —— 分配 window buffer、按 rank 派发 chip 编排器 |
 | `@pl.jit.incore` | `InCore` | 设备 kernel（可接受 `level=` 指定层级） |
 | `@pl.jit.inline` | `Inline` | 由 `InlineFunctions` 在每个调用点展开的辅助函数 |
@@ -105,9 +106,21 @@ def host_orch(
     return outputs
 ```
 
-普通 `@pl.jit` 入口**不会**发现其他 `@pl.jit` 入口 —— 只有 `.host` 跨越 chip 边界。这防止两个互不相关的顶层 kernel 被静默折叠进同一个程序。
+`@pl.jit.pod` 入口会发现 `.host` 依赖，并继续发现其传递的 chip 和 kernel 依赖。
+编排器派发遵循 `pod -> host -> chip`；跳级、向上调用以及 HOST/POD 同级调用会报错，
+错误信息包含双方函数名和层级。现有辅助函数依赖在各层仍可使用。
 
-`@pl.jit.host` 拒绝 `level=`（HOST 是隐含的）。
+普通 `@pl.jit` 入口**不会**发现其他 `@pl.jit` 入口。这防止两个互不相关的顶层 kernel 被静默折叠进同一个程序。
+
+`@pl.jit.host` 和 `@pl.jit.pod` 的层级固定，因此拒绝 `level=`。
+两者都支持不带括号、空括号以及 `auto_scope=False` 三种形式。
+
+POD 特化复用现有 `Function` IR 节点，使用规范写法
+`level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator`。可以调用
+`pod_entry.specialize()`、打印和重新解析源码，并序列化其 IR。
+在 cluster 代码生成和 runner 集成完成前，完整 `compile()` 和执行会抛出
+`NotImplementedError`；已有 HOST 可执行产物不能启用 POD 入口。
+直接调用 `ir.compile(program)` 也会在初始化后端前拒绝显式或嵌套的 L4 编排。
 
 ### 子函数返回的张量会保留 shape 和 dtype
 
