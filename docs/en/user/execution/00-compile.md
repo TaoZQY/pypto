@@ -76,6 +76,7 @@ move. All are keyword-only — only `program` is positional.
 | `disabled_diagnostics` | `None` | Silence specific checks rather than all of them |
 | `profiling` | `False` | Per-stage compile timing into `report/pipeline_profile.{txt,json}` |
 | `distributed_config` | `None` | Compile a HOST-level program per rank ([Distributed](../distributed/index.md)) |
+| `cluster_config` | `None` | POD/CLUSTER_0 placement and launcher settings; mutually exclusive with `distributed_config`. Full POD compilation remains unsupported ([Cluster configuration](../distributed/03-execution.md#cluster-launch-configuration-podcluster_0)) |
 | `analyze_auto_scopes_for_deps` | `False` | Compiler-derived dependencies for AUTO scopes |
 | `enable_pypto_l0c_double_buffer` | `None` | L0C double buffering |
 | `emit_source_loc` | `None` | Carry DSL source locations into the emitted `.pto` |

@@ -3604,6 +3604,7 @@ class JITFunction:
             platform=target_platform,
             strategy=compile_kwargs["strategy"],
             distributed_config=compile_kwargs.get("distributed_config"),
+            cluster_config=compile_kwargs.get("cluster_config"),
             analyze_auto_scopes_for_deps=compile_kwargs["analyze_auto_scopes_for_deps"],
             emit_source_loc=compile_kwargs["emit_source_loc"],
             memory_planner=compile_kwargs.get("memory_planner", _resolve_memory_planner(None)),

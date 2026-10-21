@@ -67,6 +67,7 @@ assert compiled.param_names == ["a", "b", "out"]
 | `disabled_diagnostics` | `None` | 关掉特定检查，而不是全部 |
 | `profiling` | `False` | 逐阶段编译计时写入 `report/pipeline_profile.{txt,json}` |
 | `distributed_config` | `None` | 按 rank 编译 HOST 级程序（[分布式](../distributed/index.md)） |
+| `cluster_config` | `None` | POD/CLUSTER_0 设备分配及启动器设置；与 `distributed_config` 互斥。完整 POD 编译仍未支持（[集群配置](../distributed/03-execution.md#集群启动配置podcluster_0)） |
 | `analyze_auto_scopes_for_deps` | `False` | 对 AUTO 作用域做编译器推导依赖 |
 | `enable_pypto_l0c_double_buffer` | `None` | L0C double buffer |
 | `emit_source_loc` | `None` | 把 DSL 源位置带进发出的 `.pto` |

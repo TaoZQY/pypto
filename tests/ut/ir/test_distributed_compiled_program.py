@@ -501,5 +501,154 @@ def test_reload_platform_warns_but_explicit_mode_and_metadata_are_silent(compile
     assert (tmp_path / _DISTRIBUTED_META_FILENAME).read_bytes() == metadata
 
 
+def _c1d1_cluster(**overrides):
+    # Lazy imports keep unrelated distributed tests collectible before the API exists.
+    from pypto.ir.distributed_compiled_program import (  # noqa: PLC0415
+        ClusterConfig,
+        ClusterNodeSpec,
+    )
+
+    values = {
+        "nodes": [ClusterNodeSpec("node-a", [5, 2]), ClusterNodeSpec("node-b", [3, 1])],
+        "python_executable": "/opt/runtime/bin/python",
+    }
+    return ClusterConfig(**(values | overrides))
+
+
+def test_c1d1_cluster_public_exports_are_identical():
+    from pypto.ir.distributed_compiled_program import (  # noqa: PLC0415
+        ClusterConfig,
+        ClusterNodeSpec,
+    )
+
+    for name, cls in (("ClusterConfig", ClusterConfig), ("ClusterNodeSpec", ClusterNodeSpec)):
+        assert getattr(ir, name) is cls
+        assert name in ir.__all__
+
+
+def test_c1d1_cluster_rank_order_and_defaults_do_not_probe_network(monkeypatch):
+    import socket  # noqa: PLC0415
+
+    def no_network(*args, **kwargs):
+        pytest.fail("ClusterConfig must not resolve hosts or establish connections")
+
+    monkeypatch.setattr(socket, "getaddrinfo", no_network)
+    monkeypatch.setattr(socket, "create_connection", no_network)
+    config = _c1d1_cluster()
+    assert config.node_device_counts() == [2, 2]
+    assert config.global_device_ranks() == [(0, 1), (2, 3)]
+    assert config.world_size() == 4  # Devices, not the two MPI node entries.
+    assert [n.devices for n in config.nodes] == [[5, 2], [3, 1]]
+    assert config.comm_profile == "a3-fabric-v1"
+    assert config.runtime == "tensormap_and_ringbuffer"
+    assert config.num_sub_workers == 0
+    assert config.startup_timeout_s == 120.0
+    assert config.mpirun_path == "mpirun"
+    assert config.mpirun_args == ()
+    assert config.aicpu_thread_num == 0
+
+
+def test_c1d1_cluster_snapshots_nested_inputs_and_nonshared_defaults():
+    from pypto.ir.distributed_compiled_program import (  # noqa: PLC0415
+        ClusterNodeSpec,
+    )
+
+    first, second = ClusterNodeSpec("node-a"), ClusterNodeSpec("node-b")
+    first.devices.append(4)
+    assert second.devices == [0]
+    devices = [6, 2]
+    node = ClusterNodeSpec("node-a", devices)
+    devices.append(9)
+    assert node.devices == [6, 2]
+    nodes = [node]
+    args = ["--bind-to", "none"]
+    config = _c1d1_cluster(nodes=nodes, mpirun_args=args)
+    nodes.clear()
+    node.devices.reverse()
+    args.append("--oversubscribe")
+    assert config.nodes[0].devices == [6, 2]
+    assert tuple(config.mpirun_args) == ("--bind-to", "none")
+
+
+@pytest.mark.parametrize("host", ["", " ", "\t", "node\nother", "node\r", "node\0", 7, None])
+def test_c1d1_cluster_node_rejects_invalid_host(host):
+    from pypto.ir.distributed_compiled_program import (  # noqa: PLC0415
+        ClusterNodeSpec,
+    )
+
+    with pytest.raises((TypeError, ValueError), match="host"):
+        ClusterNodeSpec(host)
+
+
+@pytest.mark.parametrize("devices", [[], [0, 0], [-1], [True], [1.0], ["0"], "01", None])
+def test_c1d1_cluster_node_rejects_invalid_devices(devices):
+    from pypto.ir.distributed_compiled_program import (  # noqa: PLC0415
+        ClusterNodeSpec,
+    )
+
+    with pytest.raises((TypeError, ValueError), match="devices"):
+        ClusterNodeSpec("node-a", devices)
+
+
+@pytest.mark.parametrize("nodes", [[], None, "node-a", ["node-a"], [None]])
+def test_c1d1_cluster_rejects_invalid_node_groups(nodes):
+    with pytest.raises((TypeError, ValueError), match="nodes"):
+        _c1d1_cluster(nodes=nodes)
+
+
+def test_c1d1_cluster_rejects_unequal_device_counts_with_layout_guidance():
+    from pypto.ir.distributed_compiled_program import (  # noqa: PLC0415
+        ClusterNodeSpec,
+    )
+
+    with pytest.raises(ValueError, match="(?i)(equal|unequal).*(shape|layout|device|count)"):
+        _c1d1_cluster(nodes=[ClusterNodeSpec("node-a", [0]), ClusterNodeSpec("node-b", [1, 2])])
+
+
+def test_c1d1_cluster_same_host_disjoint_entries_allowed_overlap_rejected():
+    from pypto.ir.distributed_compiled_program import (  # noqa: PLC0415
+        ClusterNodeSpec,
+    )
+
+    config = _c1d1_cluster(nodes=[ClusterNodeSpec("node-a", [4]), ClusterNodeSpec("node-a", [2])])
+    assert config.world_size() == 2
+    assert config.global_device_ranks() == [(0,), (1,)]
+    with pytest.raises(ValueError, match="(?i)(overlap|ownership|already|duplicate)"):
+        _c1d1_cluster(nodes=[ClusterNodeSpec("node-a", [4]), ClusterNodeSpec("node-a", [4])])
+
+
+@pytest.mark.parametrize("field", ["python_executable", "comm_profile", "runtime", "mpirun_path"])
+@pytest.mark.parametrize("value", ["", " \t", "bad\nvalue", "bad\rvalue", "bad\0value", 3, None])
+def test_c1d1_cluster_rejects_invalid_launch_strings(field, value):
+    with pytest.raises((TypeError, ValueError), match=field):
+        _c1d1_cluster(**{field: value})
+
+
+@pytest.mark.parametrize("field", ["num_sub_workers", "aicpu_thread_num"])
+@pytest.mark.parametrize("value", [-1, True, 1.5, "2", None])
+def test_c1d1_cluster_counts_reject_nonintegers_and_negative_values(field, value):
+    with pytest.raises((TypeError, ValueError), match=field):
+        _c1d1_cluster(**{field: value})
+
+
+def test_c1d1_cluster_aicpu_floor_and_explicit_counts():
+    with pytest.raises(ValueError, match="aicpu_thread_num"):
+        _c1d1_cluster(aicpu_thread_num=1)
+    config = _c1d1_cluster(aicpu_thread_num=2, num_sub_workers=3)
+    assert (config.aicpu_thread_num, config.num_sub_workers) == (2, 3)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, float("nan"), float("inf"), -float("inf"), "120", None])
+def test_c1d1_cluster_timeout_is_finite_positive_number(value):
+    with pytest.raises((TypeError, ValueError), match="startup_timeout_s"):
+        _c1d1_cluster(startup_timeout_s=value)
+
+
+@pytest.mark.parametrize("value", ["--oversubscribe", [1], [True], [None], None, {"--foo"}])
+def test_c1d1_cluster_launcher_arguments_require_string_sequence(value):
+    with pytest.raises((TypeError, ValueError), match="mpirun_args"):
+        _c1d1_cluster(mpirun_args=value)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

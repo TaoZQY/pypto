@@ -1242,5 +1242,82 @@ def test_positional_compile_options_platform_is_deprecated():
     assert options.execution_mode is ExecutionMode.ONBOARD
 
 
+def _c1d1_cluster_config():
+    from pypto.ir import (  # noqa: PLC0415
+        ClusterConfig,
+        ClusterNodeSpec,
+    )
+
+    return ClusterConfig([ClusterNodeSpec("node-a", [2]), ClusterNodeSpec("node-b", [5])], "/env/bin/python")
+
+
+@pytest.mark.parametrize("source", ["run_config", "compile_options"])
+def test_c1d1_cluster_config_forwarded_through_compile_options(source):
+    from pypto.jit.cache import (  # noqa: PLC0415
+        _freeze,
+    )
+
+    cluster = _c1d1_cluster_config()
+    options = (
+        RunConfig(
+            backend_type=BackendType.Ascend910, execution_mode=ExecutionMode.SIM, cluster_config=cluster
+        ).compile_options()
+        if source == "run_config"
+        else CompileOptions(
+            backend_type=BackendType.Ascend910, execution_mode=ExecutionMode.SIM, cluster_config=cluster
+        )
+    )
+    kwargs = options.as_compile_kwargs()
+    assert _freeze(options.cluster_config) == _freeze(cluster)
+    assert _freeze(kwargs["cluster_config"]) == _freeze(cluster)
+    assert kwargs["backend_type"] is BackendType.Ascend910
+    assert kwargs["execution_mode"] is ExecutionMode.SIM
+    # A compile request owns its nested settings even if the caller reuses them.
+    cluster.nodes[0].devices[0] = 7
+    assert kwargs["cluster_config"].nodes[0].devices == [2]
+
+
+def test_c1d1_run_config_compile_kwargs_carries_cluster_and_omits_unset():
+    from pypto.jit.cache import (  # noqa: PLC0415
+        _freeze,
+    )
+
+    cluster = _c1d1_cluster_config()
+    config = RunConfig(cluster_config=cluster)
+    assert _freeze(config.compile_kwargs()["cluster_config"]) == _freeze(cluster)
+    assert "cluster_config" not in RunConfig().compile_kwargs()
+    assert "cluster_config" not in CompileOptions().as_compile_kwargs()
+
+
+def test_c1d1_run_config_explicit_typechecking_constructor_matches_fields():
+    import ast  # noqa: PLC0415
+    import inspect  # noqa: PLC0415
+
+    from pypto.runtime import (  # noqa: PLC0415
+        runner,
+    )
+
+    assert "cluster_config" in {f.name for f in dataclasses.fields(RunConfig)}
+    assert "cluster_config" in {f.name for f in dataclasses.fields(CompileOptions)}
+    tree = ast.parse(inspect.getsource(runner))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "RunConfig")
+    init = next(n for n in ast.walk(cls) if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    declared = {arg.arg for arg in init.args.kwonlyargs}
+    assert declared == {f.name for f in dataclasses.fields(RunConfig)} | {"platform", "backend_type"}
+
+
+@pytest.mark.parametrize("source", ["run_config", "compile_options"])
+def test_c1d1_compile_options_reject_conflicting_cluster_and_distributed_configs(source):
+    from pypto.ir import (  # noqa: PLC0415
+        DistributedConfig,
+    )
+
+    cls = RunConfig if source == "run_config" else CompileOptions
+    with pytest.raises(
+        ValueError, match="(?i)(cluster_config.*distributed_config|distributed_config.*cluster_config)"
+    ):
+        cls(cluster_config=_c1d1_cluster_config(), distributed_config=DistributedConfig())
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

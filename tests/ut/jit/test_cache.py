@@ -110,13 +110,14 @@ class TestMakeCacheKey:
             tensor_dtypes={"a": DataType.FP32},
         )
         assert isinstance(key, tuple)
-        assert len(key) == 6
-        source_hash, platform, strategy, tensor_part, dist_part, compile_opts = key
+        assert len(key) == 7
+        source_hash, platform, strategy, tensor_part, dist_part, compile_opts, cluster_part = key
         assert source_hash == "abc"
         assert platform is None
         assert strategy is None
         assert isinstance(tensor_part, tuple)
         assert dist_part is None  # single-chip default
+        assert cluster_part is None
         assert compile_opts == (
             ("scalar_semantics", 2),
             ("analyze_auto_scopes_for_deps", False),
@@ -135,7 +136,7 @@ class TestMakeCacheKey:
             tensor_shapes={"a": (128, 64)},
             tensor_dtypes={"a": DataType.FP32},
         )
-        _, _, _, tensor_part, _, _ = key
+        _, _, _, tensor_part, _, _, _ = key
         assert len(tensor_part) == 1
         info = tensor_part[0]
         assert info.name == "a"
@@ -149,7 +150,7 @@ class TestMakeCacheKey:
             tensor_dtypes={"a": DataType.FP32},
             dynamic_dims={("a", 0)},
         )
-        _, _, _, tensor_part, _, _ = key
+        _, _, _, tensor_part, _, _, _ = key
         assert tensor_part[0].shape == (None, 128)
 
     def test_dynamic_dim_cache_hit_on_different_concrete_value(self):
@@ -195,7 +196,7 @@ class TestMakeCacheKey:
         folded into the body could be served to a request that expects the
         parameter to stay symbolic.
         """
-        _, _, _, _, _, compile_opts = self._make_key(param_names=["B"])
+        _, _, _, _, _, compile_opts, _ = self._make_key(param_names=["B"])
         assert compile_opts is not None
         assert ("scalar_semantics", SCALAR_SEMANTICS) in compile_opts
 
@@ -208,7 +209,7 @@ class TestMakeCacheKey:
             tensor_dtypes={"a": DataType.FP16, "b": DataType.FP32},
             dynamic_dims=set(),
         )
-        _, _, _, tensor_part, _, _ = key
+        _, _, _, tensor_part, _, _, _ = key
         assert tensor_part[0].name == "b"
         assert tensor_part[1].name == "a"
 
@@ -1363,6 +1364,179 @@ class TestConstexprParameters:
 
         assert records, "the dep's own binding must still be recorded"
         assert all(len(record) == 5 for record in records)
+
+
+def _c1d1_cluster_config(**overrides):
+    from pypto.ir import (  # noqa: PLC0415
+        ClusterConfig,
+        ClusterNodeSpec,
+    )
+
+    values = {
+        "nodes": [ClusterNodeSpec("node-a", [2, 5]), ClusterNodeSpec("node-b", [7, 3])],
+        "python_executable": "/env/bin/python",
+    }
+    return ClusterConfig(**(values | overrides))
+
+
+def _c1d1_cluster_key(cluster):
+    return make_cache_key("c1d1", [], {}, {}, set(), cluster_config=cluster)
+
+
+@pytest.mark.parametrize(
+    "dimension",
+    [
+        "node_order",
+        "host",
+        "devices",
+        "device_order",
+        "comm_profile",
+        "runtime",
+        "python_executable",
+        "mpirun_path",
+        "mpirun_args",
+        "num_sub_workers",
+        "aicpu_thread_num",
+        "startup_timeout_s",
+    ],
+)
+def test_c1d1_cluster_each_launch_dimension_splits_cache_key(dimension):
+    cluster = _c1d1_cluster_config()
+    changed = _c1d1_cluster_config()
+    if dimension == "node_order":
+        changed.nodes.reverse()
+    elif dimension == "host":
+        changed.nodes[0].host = "node-c"
+    elif dimension == "devices":
+        changed.nodes[0].devices[0] = 4
+    elif dimension == "device_order":
+        changed.nodes[0].devices.reverse()
+    else:
+        values = {
+            "comm_profile": "a3-fabric-v2",
+            "runtime": "alternative-runtime",
+            "python_executable": "/env-v2/bin/python",
+            "mpirun_path": "/mpi/bin/mpirun",
+            "mpirun_args": ("--bind-to", "none"),
+            "num_sub_workers": 2,
+            "aicpu_thread_num": 4,
+            "startup_timeout_s": 180.0,
+        }
+        setattr(changed, dimension, values[dimension])
+    assert _c1d1_cluster_key(changed) != _c1d1_cluster_key(cluster)
+
+
+def test_c1d1_cluster_cache_key_is_recursive_value_snapshot():
+    from pypto.jit.cache import (  # noqa: PLC0415
+        _freeze,
+    )
+
+    cluster = _c1d1_cluster_config()
+    frozen = _freeze(cluster)
+    first = _c1d1_cluster_key(cluster)
+    first_hash = hash(first)
+    assert first == _c1d1_cluster_key(_c1d1_cluster_config())
+    assert frozen in first  # Keep the existing recursive dataclass representation.
+    assert first != _c1d1_cluster_key(None)
+    cluster.nodes[0].devices.reverse()
+    assert hash(first) == first_hash
+    assert first != _c1d1_cluster_key(cluster)
+
+
+def test_c1d1_cluster_key_rejects_distributed_config_conflict():
+    with pytest.raises(
+        ValueError, match="(?i)(cluster_config.*distributed_config|distributed_config.*cluster_config)"
+    ):
+        make_cache_key(
+            "c1d1",
+            [],
+            {},
+            {},
+            set(),
+            cluster_config=_c1d1_cluster_config(),
+            distributed_config=DistributedConfig(),
+        )
+
+
+def test_c1d1_actual_pod_jit_forwards_cluster_config_and_caches_by_value(monkeypatch):
+    from pypto import CacheConfig  # noqa: PLC0415
+    from pypto.jit.cache import (  # noqa: PLC0415
+        _freeze,
+    )
+
+    compiler = importlib.import_module("pypto.ir.compile")
+    decorator = importlib.import_module("pypto.jit.decorator")
+    built = []
+    dispatched = []
+
+    @pl.jit.pod
+    def entry(x: pl.Tensor[[8], pl.FP32]) -> pl.Tensor[[8], pl.FP32]:
+        return x
+
+    def compile_program(program, **kwargs):
+        assert next(iter(program.functions.values())).level == pl.Level.CLUSTER_0
+        snapshot = _freeze(kwargs["cluster_config"])
+
+        def execute(*args, **run_kwargs):
+            dispatched.append((snapshot, args, run_kwargs))
+            return snapshot
+
+        built.append(snapshot)
+        return execute
+
+    # Only bypass C1c's temporary full-program guard; specialization, keying,
+    # compile forwarding, and __call__ dispatch remain the real public path.
+    monkeypatch.setattr(decorator, "_check_supported_orchestration_level", lambda level: None)
+    monkeypatch.setattr(compiler, "compile", compile_program)
+    cluster = _c1d1_cluster_config()
+    config = RunConfig(cluster_config=cluster, cache_config=CacheConfig(enabled=False))
+    import torch  # noqa: PLC0415
+
+    sample = torch.zeros(8)
+    first = entry(sample, config=config)
+    assert entry(sample, config=config) == first
+    assert len(built) == 1
+    config.cluster_config.nodes[0].devices.reverse()
+    second = entry(sample, config=config)
+    assert second != first
+    assert len(built) == 2
+    assert len(dispatched) == 3
+    assert dispatched[0][1] == (sample,)
+    assert dispatched[0][2]["config"] is config
+
+
+def test_c1d1_pod_compile_and_key_share_cluster_snapshot(monkeypatch):
+    from pypto import CacheConfig  # noqa: PLC0415
+    from pypto.jit.cache import (  # noqa: PLC0415
+        _freeze,
+    )
+
+    compiler = importlib.import_module("pypto.ir.compile")
+    decorator = importlib.import_module("pypto.jit.decorator")
+    cluster = _c1d1_cluster_config()
+    config = RunConfig(cluster_config=cluster, cache_config=CacheConfig(enabled=False))
+    expected = _freeze(cluster)
+    make_key = decorator.make_cache_key
+    compiled_configs = []
+
+    @pl.jit.pod
+    def entry(x: pl.Tensor[[8], pl.FP32]) -> pl.Tensor[[8], pl.FP32]:
+        return x
+
+    def mutate_after_key(**kwargs):
+        result = make_key(**kwargs)
+        config.cluster_config.nodes[0].devices.reverse()
+        return result
+
+    def compile_program(program, **kwargs):
+        compiled_configs.append(_freeze(kwargs["cluster_config"]))
+        return program
+
+    monkeypatch.setattr(decorator, "_check_supported_orchestration_level", lambda level: None)
+    monkeypatch.setattr(decorator, "make_cache_key", mutate_after_key)
+    monkeypatch.setattr(compiler, "compile", compile_program)
+    entry.compile(config=config)
+    assert compiled_configs == [expected]
 
 
 if __name__ == "__main__":

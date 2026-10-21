@@ -247,5 +247,86 @@ def test_compile_platform_deprecation_does_not_leak_into_new_api(tmp_path, legac
     assert compiled.platform == "a2a3"
 
 
+def _c1d1_level_program(level):
+    span = ir.Span.unknown()
+    func = ir.Function("main", [], [], ir.SeqStmts([], span), span, level=level, role=ir.Role.Orchestrator)
+    return ir.Program([func], "c1d1_cluster_config", span)
+
+
+@pytest.mark.parametrize("level", [ir.Level.CHIP, ir.Level.HOST])
+def test_c1d1_compile_cluster_config_rejects_noncluster_before_backend(tmp_path, monkeypatch, level):
+    import importlib  # noqa: PLC0415
+
+    from pypto.ir import (  # noqa: PLC0415
+        ClusterConfig,
+        ClusterNodeSpec,
+    )
+
+    compile_module = importlib.import_module("pypto.ir.compile")
+
+    def no_backend(**kwargs):
+        pytest.fail("Invalid cluster placement must fail before backend selection")
+
+    monkeypatch.setattr(compile_module, "_select_backend", no_backend)
+    destination = tmp_path / "must_not_exist"
+    with pytest.raises(ValueError, match="(?i)cluster_config.*(POD|CLUSTER_0|L4|cluster)"):
+        ir.compile(
+            _c1d1_level_program(level),
+            output_dir=str(destination),
+            cluster_config=ClusterConfig([ClusterNodeSpec("node-a")], "/env/bin/python"),
+        )
+    assert not destination.exists()
+
+
+def test_c1d1_compile_cluster_distributed_conflict_rejected_before_backend(tmp_path, monkeypatch):
+    import importlib  # noqa: PLC0415
+
+    from pypto.ir import (  # noqa: PLC0415
+        ClusterConfig,
+        ClusterNodeSpec,
+        DistributedConfig,
+    )
+
+    compile_module = importlib.import_module("pypto.ir.compile")
+
+    def no_backend(**kwargs):
+        pytest.fail("Conflicting launch configs must fail before backend selection")
+
+    monkeypatch.setattr(compile_module, "_select_backend", no_backend)
+    with pytest.raises(
+        ValueError, match="(?i)(cluster_config.*distributed_config|distributed_config.*cluster_config)"
+    ):
+        ir.compile(
+            _c1d1_level_program(ir.Level.HOST),
+            output_dir=str(tmp_path / "conflict"),
+            cluster_config=ClusterConfig([ClusterNodeSpec("node-a")], "/env/bin/python"),
+            distributed_config=DistributedConfig(),
+        )
+    assert not (tmp_path / "conflict").exists()
+
+
+def test_c1d1_compile_cluster_config_retains_temporary_pod_guard(tmp_path, monkeypatch):
+    import importlib  # noqa: PLC0415
+
+    from pypto.ir import (  # noqa: PLC0415
+        ClusterConfig,
+        ClusterNodeSpec,
+    )
+
+    compile_module = importlib.import_module("pypto.ir.compile")
+
+    def no_backend(**kwargs):
+        pytest.fail("Full POD compilation remains unsupported before C3")
+
+    monkeypatch.setattr(compile_module, "_select_backend", no_backend)
+    with pytest.raises(NotImplementedError, match="(?i)(POD|CLUSTER_0|L4)"):
+        ir.compile(
+            _c1d1_level_program(ir.Level.CLUSTER_0),
+            output_dir=str(tmp_path / "pod"),
+            cluster_config=ClusterConfig([ClusterNodeSpec("node-a")], "/env/bin/python"),
+        )
+    assert not (tmp_path / "pod").exists()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -16,6 +16,7 @@ through simpler's distributed runtime (Worker level=3)::
     compiled(a, b, c)   # executes via simpler Worker(level=3)
 """
 
+import math
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, fields
@@ -66,6 +67,127 @@ if TYPE_CHECKING:
     from pypto.runtime._artifact_runtime import ArtifactRuntime
     from pypto.runtime.distributed_runner import DistributedWorker, ReadOnlyHostTensor
     from pypto.runtime.runner import RunConfig
+
+
+def _validate_cluster_text(value: str, name: str) -> None:
+    """Validate launcher text without resolving hosts or normalizing user order."""
+    if not isinstance(value, str) or not value.strip() or any(c in value for c in "\0\r\n"):
+        raise ValueError(f"{name} must be a non-empty string without NUL or newlines, got {value!r}")
+
+
+@dataclass
+class ClusterNodeSpec:
+    """One MPI node entry and its ordered physical device indices.
+
+    Separate entries may name the same host when their devices are disjoint.
+    Construction copies the device list and performs no network operations.
+    """
+
+    host: str
+    devices: list[int] = field(default_factory=lambda: [0])
+
+    def __post_init__(self) -> None:
+        _validate_cluster_text(self.host, "ClusterNodeSpec.host")
+        if not isinstance(self.devices, list) or not self.devices:
+            raise ValueError(f"ClusterNodeSpec.devices must be a non-empty list, got {self.devices!r}")
+        if any(type(device) is not int or device < 0 for device in self.devices):
+            raise ValueError(
+                f"ClusterNodeSpec.devices must contain non-negative ints (not bools), got {self.devices!r}"
+            )
+        if len(set(self.devices)) != len(self.devices):
+            raise ValueError(f"ClusterNodeSpec.devices must be distinct, got {self.devices!r}")
+        self.devices = list(self.devices)
+
+
+@dataclass
+class ClusterConfig:
+    """Validated launch settings for future POD/CLUSTER_0 execution.
+
+    Each node entry owns an ordered group of devices. Global device ranks are
+    contiguous in node declaration order, then device-list order. MPI entry
+    count and device world size are separate quantities. Only equal device
+    counts per entry are supported by the initial shape/layout contract.
+
+    The launcher and Python executable are explicit strings; this configuration
+    performs no discovery or network operations. Full POD compilation remains
+    unsupported until cluster codegen and runner integration are implemented.
+    """
+
+    nodes: list[ClusterNodeSpec]
+    python_executable: str
+    comm_profile: str = "a3-fabric-v1"
+    runtime: str = "tensormap_and_ringbuffer"
+    num_sub_workers: int = 0
+    startup_timeout_s: float = 120.0
+    mpirun_path: str = "mpirun"
+    mpirun_args: tuple[str, ...] | list[str] = ()
+    aicpu_thread_num: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.nodes, list) or not self.nodes:
+            raise ValueError(
+                f"ClusterConfig.nodes must be a non-empty list of ClusterNodeSpec, got {self.nodes!r}"
+            )
+        if any(not isinstance(node, ClusterNodeSpec) for node in self.nodes):
+            raise ValueError(f"ClusterConfig.nodes must contain ClusterNodeSpec entries, got {self.nodes!r}")
+        # Reconstruct nested entries to both revalidate mutations and take
+        # ownership. dataclasses.replace(config) is therefore a validated snapshot.
+        self.nodes = [ClusterNodeSpec(node.host, node.devices) for node in self.nodes]
+        owned: dict[str, set[int]] = {}
+        for node in self.nodes:
+            previous = owned.setdefault(node.host, set())
+            overlap = previous.intersection(node.devices)
+            if overlap:
+                raise ValueError(
+                    f"ClusterConfig.nodes have overlapping device ownership on {node.host!r}: {overlap}"
+                )
+            previous.update(node.devices)
+        if len(set(self.node_device_counts())) != 1:
+            raise ValueError(
+                "ClusterConfig requires equal device counts per node; unequal shape/layout is unsupported"
+            )
+        for name in ("python_executable", "comm_profile", "runtime", "mpirun_path"):
+            _validate_cluster_text(getattr(self, name), f"ClusterConfig.{name}")
+        for name in ("num_sub_workers", "aicpu_thread_num"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"ClusterConfig.{name} must be a non-negative int (not bool), got {value!r}")
+        if self.aicpu_thread_num == 1:
+            raise ValueError(
+                "ClusterConfig.aicpu_thread_num must be 0 (architecture default) or at least 2, got 1"
+            )
+        if (
+            type(self.startup_timeout_s) not in (int, float)
+            or not math.isfinite(self.startup_timeout_s)
+            or self.startup_timeout_s <= 0
+        ):
+            raise ValueError(
+                f"ClusterConfig.startup_timeout_s must be finite and positive, got {self.startup_timeout_s!r}"
+            )
+        if not isinstance(self.mpirun_args, (tuple, list)):
+            raise ValueError(
+                f"ClusterConfig.mpirun_args must be a tuple or list of strings, got {self.mpirun_args!r}"
+            )
+        for arg in self.mpirun_args:
+            _validate_cluster_text(arg, "ClusterConfig.mpirun_args item")
+        self.mpirun_args = tuple(self.mpirun_args)
+
+    def node_device_counts(self) -> list[int]:
+        """Return the number of devices owned by each MPI node entry."""
+        return [len(node.devices) for node in self.nodes]
+
+    def global_device_ranks(self) -> list[tuple[int, ...]]:
+        """Return each node's prefix-contiguous global device ranks."""
+        ranks = []
+        offset = 0
+        for count in self.node_device_counts():
+            ranks.append(tuple(range(offset, offset + count)))
+            offset += count
+        return ranks
+
+    def world_size(self) -> int:
+        """Return total device count, independently of MPI node-entry count."""
+        return sum(self.node_device_counts())
 
 
 @dataclass

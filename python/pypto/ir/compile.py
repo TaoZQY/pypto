@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .compiled_program import CompiledProgram
-    from .distributed_compiled_program import DistributedCompiledProgram
+    from .distributed_compiled_program import ClusterConfig, DistributedCompiledProgram
 
 
 def _highest_orchestration_level(program: _ir_core.Program) -> _ir_core.Level | None:
@@ -348,6 +348,7 @@ def compile(  # noqa: PLR0913
     platform: str | None = None,
     execution_mode: ExecutionMode | None = None,
     distributed_config: Any = None,
+    cluster_config: "ClusterConfig | None" = None,
     analyze_auto_scopes_for_deps: bool = False,
     emit_source_loc: bool | None = None,
     dump_ptoas_passes: bool = False,
@@ -433,6 +434,10 @@ def compile(  # noqa: PLR0913
             distributed programs.  When ``None`` (default), auto-detected
             from the program: if L3+ functions are found, a default
             ``DistributedConfig()`` is used.
+        cluster_config: Optional :class:`ClusterConfig` for POD/CLUSTER_0
+            orchestration. Cannot be combined with ``distributed_config`` or
+            supplied for HOST/CHIP programs. Full POD compilation remains
+            unsupported until cluster codegen and runner integration exist.
         analyze_auto_scopes_for_deps: If True, let
             ``AutoDeriveTaskDependencies`` analyze AUTO runtime scopes. The
             default is False to preserve the existing TensorMap-fallback
@@ -464,7 +469,13 @@ def compile(  # noqa: PLR0913
     """
     # Reject unsupported full programs before backend discovery or output
     # creation. Low-level codegen keeps its legacy POD alias behavior.
-    _check_supported_orchestration_level(_highest_orchestration_level(program))
+    highest_level = _highest_orchestration_level(program)
+    if cluster_config is not None:
+        if distributed_config is not None:
+            raise ValueError("cluster_config and distributed_config cannot both be supplied")
+        if highest_level is None or _ir_core.level_to_linqu_level(highest_level) < 4:
+            raise ValueError("cluster_config requires POD/CLUSTER_0 (L4) or higher orchestration")
+    _check_supported_orchestration_level(highest_level)
     if platform is not None:
         _warn_deprecated_platform("ir.compile")
     backend_type, mode = _resolve_target(backend_type, execution_mode, platform)
