@@ -145,5 +145,19 @@ class TestFunctionAttrsPrinterRoundtrip:
             ir.assert_structural_equal(A, B)
 
 
+@pytest.mark.parametrize("key", ["worker", "device"])
+def test_worker_dispatch_does_not_coerce_ordinary_function_integer_attrs(key):
+    """Placement names are reserved on dispatch nodes, not on Function metadata."""
+    span = ir.Span.unknown()
+    func = ir.Function("f", [], [], _make_nop_body(), span, attrs={key: 7})
+    assert type(func.attrs[key]) is int
+    assert dict(func.attrs) == {key: 7}
+
+    restored = ir.deserialize(ir.serialize(func))
+    assert type(restored.attrs[key]) is int
+    assert dict(restored.attrs) == {key: 7}
+    ir.assert_structural_equal(func, restored)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

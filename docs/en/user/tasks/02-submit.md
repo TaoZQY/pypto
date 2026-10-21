@@ -159,16 +159,20 @@ in an order you want pinned explicitly — e.g. a WAIT living in a different dis
 same rank's SEND:
 
 ```python
-_sent, send_task = pl.submit(self.send_orch, x, echo, dst, signal, peer, device=rank)
-_received, _ = pl.submit(self.recv_orch, out, dst, signal, device=rank,
+_sent, send_task = pl.submit(self.send_orch, x, echo, dst, signal, peer, worker=rank)
+_received, _ = pl.submit(self.recv_orch, out, dst, signal, worker=rank,
                          deps=[send_task])
 ```
+
+`worker=rank` selects a logical immediate child of the calling orchestrator, not a physical
+device ID. `device=` remains a deprecated alias and emits `DeprecationWarning`. Supply
+placement once: mixing `worker`, `device`, or a placement entry in `attrs` is rejected.
 
 Two differences from the L2 form above:
 
 - **Every callee argument is required, including `Out` / `InOut` tensors** — L3 does not
   allocate output tensors, so nothing can fill an omitted slot.
-- **Only `deps=` is available.** `core_num`, `sync_start`, `allow_early_resolve` and
+- **Explicit ordering uses `deps=`.** `core_num`, `sync_start`, `allow_early_resolve` and
   `predicate=` have no L3 counterpart and are rejected; `pl.spmd_submit` is likewise not
   available at HOST level.
 

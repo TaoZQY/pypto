@@ -125,15 +125,19 @@ L3 运行时的不透明任务句柄（`TaskHandle`）背书，每个 `deps=[pro
 `TaskArgs.add_dep_wait(producer)`：一条只约束执行顺序、不延长 producer 资源生命期的边。显式边叠加在自动维护的 per-rank 通信排序之上；当同一 rank 的派发通过通信 window 交互、而你想显式钉住顺序时使用它 —— 例如 WAIT 与同 rank 的 SEND 分属不同派发：
 
 ```python
-_sent, send_task = pl.submit(self.send_orch, x, echo, dst, signal, peer, device=rank)
-_received, _ = pl.submit(self.recv_orch, out, dst, signal, device=rank,
+_sent, send_task = pl.submit(self.send_orch, x, echo, dst, signal, peer, worker=rank)
+_received, _ = pl.submit(self.recv_orch, out, dst, signal, worker=rank,
                          deps=[send_task])
 ```
+
+`worker=rank` 选择调用编排函数的逻辑直接子 worker，而不是物理设备编号。
+`device=` 保留为兼容别名，并产生 `DeprecationWarning`。位置只能指定一次；
+同时使用 `worker`、`device` 或 `attrs` 中的位置字段会被拒绝。
 
 与上文 L2 形式的两点差异：
 
 - **必须传入被调方的每一个实参，包括 `Out` / `InOut` 张量** —— L3 不分配输出张量，省略的槽位没有任何东西能补上。
-- **只有 `deps=` 可用。** `core_num`、`sync_start`、`allow_early_resolve` 与 `predicate=`
+- **显式顺序使用 `deps=`。** `core_num`、`sync_start`、`allow_early_resolve` 与 `predicate=`
   在 L3 没有对应物，会被拒绝；`pl.spmd_submit` 同样在 HOST 级不可用。
 
 ### 用 TaskId 数组做扇入

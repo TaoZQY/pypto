@@ -76,7 +76,7 @@ namespace {
   return call && call->op_ && IsOp(call, "pld.tensor.all_to_all_v");
 }
 
-/// Device coverage descriptor inferred from a dispatch ``device=`` expression.
+/// Device coverage descriptor inferred from a dispatch ``worker=`` expression.
 struct DeviceDescriptor {
   bool is_all = false;
   std::set<int64_t> subset;
@@ -206,7 +206,7 @@ class AllocAndWindowCollector : public IRVisitor {
 
 /// Detects whether a Call resolves to a chip-level Orchestration function (i.e.
 /// the host_orch is dispatching down one level). Such calls carry the
-/// ``device=`` attr written by the N3 parser pass.
+/// ``worker=`` attr written by the N3 parser pass.
 [[nodiscard]] bool IsChipOrchDispatch(const CallPtr& op,
                                       const std::map<std::string, FunctionPtr>& chip_orchs) {
   if (!op || !op->op_) return false;
@@ -233,9 +233,9 @@ class AllocAndWindowCollector : public IRVisitor {
   return cur;
 }
 
-/// Resolves the device descriptor for a ``device=`` Expr in the context of a
+/// Resolves the device descriptor for a ``worker=`` Expr in the context of a
 /// stack of enclosing ForStmt scopes. Throws pypto::ValueError on unsupported
-/// forms (the user's parser is meant to restrict ``device=`` to ConstInt or
+/// forms (the user's parser is meant to restrict ``worker=`` to ConstInt or
 /// the induction var of an enclosing pl.range loop).
 DeviceDescriptor ResolveDeviceDescriptor(const ExprPtr& device, const std::vector<ForStmtPtr>& for_stack,
                                          const std::unordered_map<const Var*, ExprPtr>& var_defs,
@@ -243,7 +243,7 @@ DeviceDescriptor ResolveDeviceDescriptor(const ExprPtr& device, const std::vecto
   DeviceDescriptor desc;
   if (auto ci = As<ConstInt>(device)) {
     INTERNAL_CHECK_SPAN(ci->value_ >= 0, dispatch_span)
-        << "MaterializeCommDomainScopes: device= ConstInt must be non-negative, got " << ci->value_;
+        << "MaterializeCommDomainScopes: worker= ConstInt must be non-negative, got " << ci->value_;
     desc.subset.insert(ci->value_);
     return desc;
   }
@@ -264,30 +264,30 @@ DeviceDescriptor ResolveDeviceDescriptor(const ExprPtr& device, const std::vecto
         if (auto stop_ci = As<ConstInt>(stop)) {
           auto start_ci = As<ConstInt>(UnwrapStopExpr(fs->start_, var_defs));
           INTERNAL_CHECK_SPAN(start_ci, dispatch_span)
-              << "MaterializeCommDomainScopes: device=r loop start must unwrap to ConstInt";
+              << "MaterializeCommDomainScopes: worker=r loop start must unwrap to ConstInt";
           int64_t start = start_ci->value_;
           auto step_ci = As<ConstInt>(UnwrapStopExpr(fs->step_, var_defs));
           INTERNAL_CHECK_SPAN(step_ci, dispatch_span)
-              << "MaterializeCommDomainScopes: device=r loop step must unwrap to ConstInt";
+              << "MaterializeCommDomainScopes: worker=r loop step must unwrap to ConstInt";
           int64_t step = step_ci->value_;
           INTERNAL_CHECK_SPAN(step == 1, dispatch_span)
-              << "MaterializeCommDomainScopes: device=r over a non-unit-step loop is not supported (step="
+              << "MaterializeCommDomainScopes: worker=r over a non-unit-step loop is not supported (step="
               << step << ")";
           INTERNAL_CHECK_SPAN(start >= 0 && stop_ci->value_ >= start, dispatch_span)
-              << "MaterializeCommDomainScopes: device=r loop range must be [0, N) with N>=0";
+              << "MaterializeCommDomainScopes: worker=r loop range must be [0, N) with N>=0";
           for (int64_t i = start; i < stop_ci->value_; ++i) desc.subset.insert(i);
           return desc;
         }
         throw pypto::ValueError(
-            "MaterializeCommDomainScopes: device=r loop bound must be ConstInt or pld.system.world_size()");
+            "MaterializeCommDomainScopes: worker=r loop bound must be ConstInt or pld.system.world_size()");
       }
     }
     throw pypto::ValueError(
-        "MaterializeCommDomainScopes: device= Var is not the induction variable of any enclosing pl.range "
+        "MaterializeCommDomainScopes: worker= Var is not the induction variable of any enclosing pl.range "
         "loop");
   }
   throw pypto::ValueError(
-      "MaterializeCommDomainScopes: device= expression must be ConstInt or the induction var of pl.range; "
+      "MaterializeCommDomainScopes: worker= expression must be ConstInt or the induction var of pl.range; "
       "got "
       "an unsupported expression at " +
       dispatch_span.to_string());
@@ -325,8 +325,8 @@ class DispatchAnalyzer : public IRVisitor {
     if (!IsChipOrchDispatch(op, chip_orchs_)) return;
     ExprPtr device;
     for (const auto& [k, v] : op->attrs_) {
-      if (k == kAttrDevice) {
-        // attrs["device"] is stored as ExprPtr by N3 parser.
+      if (k == kAttrWorker) {
+        // attrs["worker"] is stored as ExprPtr by N3 parser.
         if (const auto* p = std::any_cast<ExprPtr>(&v)) device = *p;
         break;
       }
@@ -467,7 +467,7 @@ class DispatchAnalyzer : public IRVisitor {
     IRVisitor::VisitExpr_(op);
   }
 
-  // A captured (`as tid`) chip-orch dispatch is a Submit; the ``device=`` attr
+  // A captured (`as tid`) chip-orch dispatch is a Submit; the ``worker=`` attr
   // it carries is analysed identically through the Call-shaped view.
   void VisitExpr_(const SubmitPtr& op) override {
     AnalyzeDispatch(SubmitToCallView(op));
@@ -697,7 +697,7 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
   DispatchAnalyzer analyzer(collector.view_to_window, chip_orchs, collector.var_defs);
   analyzer.VisitStmt(materialization_body);
 
-  // Host-level collectives do not carry their own device= selector. Their
+  // Host-level collectives do not carry their own worker= selector. Their
   // signal buffer is a user-visible window slot, so inherit paired data/target
   // coverage when present. Barrier-only consumers keep signal coverage from
   // dispatch sites, or fall back to the full comm-domain device set.
@@ -718,7 +718,7 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
     // a cross-rank hang for device-subset barriers).
     CHECK_SPAN(!consumer.signal_alloc->seen.empty(), consumer.span)
         << "MaterializeCommDomainScopes: pld.tensor.barrier signal buffer has no inferred "
-           "comm-domain coverage — add a device= annotation or ensure the signal window "
+           "comm-domain coverage — add a worker= annotation or ensure the signal window "
            "is consumed by a device-tagged chip dispatch";
   }
 

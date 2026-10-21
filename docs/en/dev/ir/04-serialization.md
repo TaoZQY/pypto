@@ -9,6 +9,12 @@ PyPTO IR serialization provides efficient MessagePack-based serialization with:
 - **Extensibility**: Field visitor pattern for easy extension
 - **Debugging info**: Preserves Span (source location)
 
+Hierarchical `Call` and `Submit` placement uses the typed Expr attr `worker`. Old
+serialized `device` attrs are normalized after resolving node references, preserving
+Var sharing with arguments and definitions. Direct IR construction uses the same
+normalization. Supplying both keys is rejected. Ordinary operator kwargs named
+`worker` or `device` retain their spelling and value.
+
 ## Quick Start
 
 ### Python API

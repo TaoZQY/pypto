@@ -303,6 +303,57 @@ def test_wrapper_forwards_explicit_comm_ctx_param_as_scalar_name():
     assert "pld.system.get_comm_ctx" not in code, code
 
 
+@pytest.mark.parametrize("submit", [False, True], ids=["call", "submit"])
+def test_worker_dispatch_host_codegen_preserves_local_child_and_argument_grouping(submit):
+    """A logical child rank controls the launch and communication-buffer lookup."""
+    launch = (
+        "result, producer = pl.submit(self.chip_orch, count, out, data, worker=1)\n"
+        "        result, consumer = pl.submit(self.chip_orch, count, out, data, "
+        "worker=1, deps=[producer])"
+        if submit
+        else "result = self.chip_orch(count, out, data, worker=1)"
+    )
+    program = pl.parse_program(f"""
+import pypto.language as pl
+import pypto.language.distributed as pld
+
+@pl.program
+class P:
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def chip_orch(
+        self, count: pl.Scalar[pl.INDEX], out: pl.Out[pl.Tensor[[64], pl.FP32]],
+        data: pld.DistributedTensor[[64], pl.FP32],
+    ) -> pl.Tensor[[64], pl.FP32]:
+        return out
+
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def host_orch(self, count: pl.Scalar[pl.INDEX], out: pl.Out[pl.Tensor[[64], pl.FP32]]):
+        data_buf = pld.alloc_window_buffer(64 * pl.FP32.get_byte())
+        data = pld.window(data_buf, [64], dtype=pl.FP32)
+        {launch}
+        return result
+""")
+    generated = _lower(program)
+    assert re.search(r'_submit_chip\(orch, callables\["chip_orch"\],.*config, 1\)', generated), generated
+    assert "__comm_d0[1].buffers" in generated, generated
+    assert "__comm_d0[1].device_ctx" in generated, generated
+    tensor_positions = [
+        match.start() for match in re.finditer(r"_ta_0\.add_tensor\(|add_chip_tensor_arg\(_ta_0,", generated)
+    ]
+    scalar_positions = [match.start() for match in re.finditer(r"_ta_0\.add_scalar\(", generated)]
+    # The supplied Out uses the host tensor helper; the window and trailing
+    # per-rank ordering token use direct additions. All precede both scalars.
+    assert len(tensor_positions) == 3, generated
+    assert len(scalar_positions) == 2, generated
+    assert max(tensor_positions) < min(scalar_positions), generated
+    assert re.search(r"_ta_0\.add_scalar\(count\)", generated), generated
+    if submit:
+        assert "producer = _ta_0_handle" in generated, generated
+        assert "_ta_1.add_dep_wait(producer)" in generated, generated
+        assert "consumer = _ta_1_handle" in generated, generated
+    compile(generated, "<worker_host_orch>", "exec")
+
+
 def test_const_device_kwarg_renders_literal_worker():
     """``device=0`` (ConstInt) lowers to the literal rank ``0`` — both the
     trailing ``_submit_chip(..., config, 0)`` arg AND the ``__comm_d0[0]`` subscript.

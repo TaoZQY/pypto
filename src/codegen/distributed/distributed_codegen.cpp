@@ -1095,10 +1095,10 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
          "`-> pl.Tuple[...]` return; declare it as `-> tuple[...]` so each result is its own "
          "return value";
 
-  // ``device=`` attr (set by N3 parser) is the single source of truth for
+  // ``worker=`` attr (set by N3 parser) is the single source of truth for
   // both the per-rank ``__comm_d0[<r>]`` subscript (used by DistributedTensor
   // arg emit) and the trailing ``worker=<r>`` kwarg on ``submit_next_level``.
-  // Empty string means no ``device=`` was set — comm-less L3 dispatch path.
+  // Empty string means no ``worker=`` was set — comm-less L3 dispatch path.
   std::string rank_expr = ResolveRankExpr(call);
 
   // Every comm domain whose window buffers this dispatch references, in first-reference
@@ -1142,8 +1142,8 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
         dist_type && handler.MaterializesWindowTensor()) {
       ++tensor_index;
       INTERNAL_CHECK_SPAN(!rank_expr.empty(), call->span_)
-          << "Call passing DistributedTensor args must carry device= attr "
-             "(N3 parser writes attrs[\"device\"] on chip-orch dispatch sites)";
+          << "Call passing DistributedTensor args must carry worker= attr "
+             "(N3 parser writes attrs[\"worker\"] on chip-orch dispatch sites)";
       INTERNAL_CHECK_SPAN(dist_type->window_buffer_.has_value(), call->span_)
           << "DistributedTensorType arg must have window_buffer_ populated by N4 pass";
       const auto& window_buffer = dist_type->window_buffer_.value();
@@ -1262,9 +1262,9 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
     emitter_.EmitLine("orch.submit_sub(sub_ids[\"" + callee->name_ + "\"], " + ta_var + ")");
   } else {
     // CHIP Worker: dispatch via ``_submit_chip`` (wraps orch.submit_next_level).
-    // N7: thread the dispatch ``device=`` attr (N3 parser) into the simpler
+    // N7: thread the dispatch ``worker=`` attr (N3 parser) into the simpler
     // runtime's ``worker=`` kwarg. A rank-pinned dispatch passes its rank; a
-    // comm-less dispatch (empty rank_expr, no ``device=``) passes ``None``,
+    // comm-less dispatch (empty rank_expr, no ``worker=``) passes ``None``,
     // which ``_submit_chip`` resolves to a concrete chip at dispatch time —
     // simpler no longer accepts an unconstrained target (simpler #1436). The
     // chip count is only known at run time, so the choice cannot be baked here.
@@ -1629,18 +1629,18 @@ std::string DistributedCodegen::DataTypeToSimplerEnum(const DataType& dtype) {
 }
 
 std::string DistributedCodegen::ResolveRankExpr(const ir::CallPtr& call) const {
-  if (!call->HasAttr(ir::kAttrDevice)) return "";
-  auto dev = call->GetAttr<ir::ExprPtr>(ir::kAttrDevice, nullptr);
-  INTERNAL_CHECK_SPAN(dev != nullptr, call->span_) << "device= attr must hold a non-null ExprPtr";
+  if (!call->HasAttr(ir::kAttrWorker)) return "";
+  auto dev = call->GetAttr<ir::ExprPtr>(ir::kAttrWorker, nullptr);
+  INTERNAL_CHECK_SPAN(dev != nullptr, call->span_) << "worker= attr must hold a non-null ExprPtr";
   if (auto ci = std::dynamic_pointer_cast<const ir::ConstInt>(dev)) {
-    CHECK(ci->value_ >= 0) << "device= ConstInt must be non-negative rank index, got " << ci->value_;
+    CHECK(ci->value_ >= 0) << "worker= ConstInt must be non-negative rank index, got " << ci->value_;
     return std::to_string(ci->value_);
   }
   if (auto v = std::dynamic_pointer_cast<const ir::Var>(dev)) {
     return SanitizeName(v->name_hint_);
   }
   INTERNAL_CHECK_SPAN(false, call->span_)
-      << "device= attr must be ConstInt or Var (N3 parser invariant), got " << dev->TypeName();
+      << "worker= attr must be ConstInt or Var (N3 parser invariant), got " << dev->TypeName();
   return "";
 }
 
@@ -1665,7 +1665,7 @@ std::string DistributedCodegen::ResolveCommCtxArg(const ir::ExprPtr& arg, const 
       << "CommCtx call arg must be produced by pld.system.get_comm_ctx or be an explicit CommCtx Var";
   INTERNAL_CHECK_SPAN(!rank_expr.empty(), span)
       << "Call passing a get_comm_ctx-derived CommCtx arg must carry "
-         "device= attr so host codegen can select the per-rank device_ctx";
+         "worker= attr so host codegen can select the per-rank device_ctx";
   INTERNAL_CHECK_SPAN(get_ctx->args_.size() == 1, get_ctx->span_)
       << "pld.system.get_comm_ctx expects exactly one DistributedTensor arg";
   auto dist_type = ir::As<ir::DistributedTensorType>(get_ctx->args_[0]->GetType());

@@ -721,5 +721,82 @@ def test_inline_helper_predicate_at_top_level_still_lowers():
     assert submits[0].predicate is not None, ir.python_print(main)
 
 
+@pytest.mark.parametrize("submit", [False, True], ids=["call", "submit"])
+def test_worker_dispatch_ssa_rebinds_attr_and_preserves_task_dependencies(submit):
+    """A placement Expr reads the current SSA definition, like an ordinary arg."""
+    launch = (
+        "out, producer = pl.submit(self.chip, x, selector, worker=selector + 1)\n"
+        "            out, consumer = pl.submit(self.chip, out, selector, "
+        "worker=selector + 1, deps=[producer])"
+        if submit
+        else "out = self.chip(x, selector, worker=selector + 1)"
+    )
+    source = f"""
+import pypto.language as pl
+
+@pl.program
+class P:
+    @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+    def chip(self, x: pl.Tensor[[64], pl.FP32], n: pl.Scalar[pl.INDEX]) -> pl.Tensor[[64], pl.FP32]:
+        return x
+
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def host(self, x: pl.Tensor[[64], pl.FP32], selector: pl.Scalar[pl.INDEX]):
+        selector = selector + 1
+        with pl.manual_scope():
+            {launch}
+        return out
+"""
+    Before = pl.parse_program(source)
+    expected_source = source.replace("selector = selector + 1", "selected = selector + 1").replace(
+        ", selector, worker=selector + 1", ", selected, worker=selected + 1"
+    )
+    if submit:
+        # Expected is authored in SSA: the second output is a fresh definition,
+        # while its input still refers to the first submit's output.
+        expected_source = expected_source.replace("out, consumer =", "final_out, consumer =").replace(
+            "return out", "return final_out"
+        )
+    Expected = pl.parse_program(expected_source)
+    After = passes.convert_to_ssa()(Before)
+    ir.assert_structural_equal(After, Expected)
+
+    launches: list[ir.Call | ir.Submit] = []
+    producer_vars: list[ir.Var] = []
+
+    class FindLaunch(ir.IRVisitor):
+        def visit_assign_stmt(self, op):
+            if op.var.name_hint.startswith("producer"):
+                producer_vars.append(op.var)
+            super().visit_assign_stmt(op)
+
+        def visit_call(self, op):
+            if isinstance(op.op, ir.GlobalVar) and op.op.name == "chip":
+                launches.append(op)
+            super().visit_call(op)
+
+        def visit_submit(self, op):
+            if op.op.name == "chip":
+                launches.append(op)
+            super().visit_submit(op)
+
+    FindLaunch().visit_program(After)
+    assert len(launches) == (2 if submit else 1)
+    for launch_ir in launches:
+        placement = launch_ir.attrs["worker"]
+        assert isinstance(placement, ir.Add)
+        assert placement.left is launch_ir.args[1]
+        assert "device" not in launch_ir.attrs
+    if submit:
+        assert isinstance(launches[1], ir.Submit)
+        assert len(launches[1].deps) == 1
+        assert len(producer_vars) == 1
+        assert launches[1].deps[0] is producer_vars[0]
+        assert launches[0].type.types[-1].dtype == pl.TASK_ID
+    text = After.as_python()
+    assert "__FREE_VAR" not in text
+    ir.assert_structural_equal(After, pl.parse_program(text))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

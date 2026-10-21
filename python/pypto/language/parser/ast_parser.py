@@ -4604,7 +4604,7 @@ class ASTParser:
                         hint=usage_hint,
                     )
                 sync_start = kw.value.value
-            # 'deps' / 'attrs' / 'device' are validated and consumed elsewhere
+            # 'deps' / 'attrs' / 'worker' / 'device' are consumed elsewhere
             # in _parse_kernel_call; ignore them here.
         if core_num is None:
             raise ParserSyntaxError(
@@ -7440,7 +7440,7 @@ class ASTParser:
         ``deps=`` / ``dumps=`` / ``timing_slot=`` are accepted only on
         ``pl.submit(...)``;
         ``core_num=`` / ``sync_start=`` only on ``pl.spmd_submit(...)``;
-        ``device=`` only when the callee is an Orchestrator. Raises
+        ``worker=`` (or deprecated ``device=``) only for an Orchestrator callee. Raises
         ``ParserTypeError`` with a targeted hint for the common
         deps/dumps-on-a-plain-call mistakes.
         """
@@ -7454,7 +7454,7 @@ class ASTParser:
         if as_spmd:
             allowed_kwargs.update({"core_num", "sync_start"})
         if func_obj is not None and func_obj.role == ir.Role.Orchestrator:
-            allowed_kwargs.add("device")
+            allowed_kwargs.update({"worker", "device"})
         for kw in keywords:
             if kw.arg in allowed_kwargs:
                 continue
@@ -7619,7 +7619,7 @@ class ASTParser:
         func_obj = self.gvar_to_func.get(gvar)
 
         # Reject unknown kwargs (``attrs`` always; ``deps`` / ``dumps`` only on
-        # submit; ``core_num`` / ``sync_start`` only on spmd_submit; ``device``
+        # submit; ``core_num`` / ``sync_start`` only on spmd_submit; ``worker`` / ``device``
         # only for an Orchestrator callee).
         self._validate_kernel_call_kwargs(method_name, func_obj, keywords, as_submit, as_spmd, span)
 
@@ -7667,9 +7667,9 @@ class ASTParser:
             in_dumps = any(arg is d for d in explicit_dump_vars)
             if (tagged or in_dumps) and isinstance(arg, ir.Var):
                 dump_vars.append(arg)
-        # Orchestration dispatch ``device=`` kwarg: resolves to a ConstInt or
-        # an enclosing-loop induction Var.
-        device_expr = self._parse_dispatch_device_kwarg(keywords)
+        # Reserve placement only on hierarchical dispatch, independently of
+        # ordinary operator kwargs and callee positional parameter names.
+        worker_expr = self._parse_dispatch_worker_kwarg(keywords, extra_attrs, func_obj)
         # ``pl.spmd_submit`` parses the SPMD launch spec (``core_num=`` /
         # ``sync_start=``) into a (positive int Expr, bool) pair recorded on
         # the resulting Submit.
@@ -7729,7 +7729,7 @@ class ASTParser:
             no_dep_indices=no_dep_indices,
             dump_vars=dump_vars,
             user_dep_vars=user_dep_vars,
-            device_expr=device_expr,
+            worker_expr=worker_expr,
             augment_task_id=as_submit,
             core_num=core_num_expr,
             sync_start=sync_start,
@@ -8364,38 +8364,47 @@ class ASTParser:
             hint=hint,
         )
 
-    def _parse_dispatch_device_kwarg(
+    def _parse_dispatch_worker_kwarg(
         self,
         keywords: list[ast.keyword],
+        extra_attrs: dict[str, Any],
+        func_obj: ir.Function | None,
     ) -> ir.Expr | None:
-        """Extract the optional ``device=`` kwarg on a ``self.<orch>(...)`` call.
+        """Extract the logical immediate-child selector for a Call or Submit.
 
-        ``device=`` selects the physical device for an orchestrator dispatch
-        and is legal only when the callee has :class:`ir.Role.Orchestrator`
-        (i.e. either chip-level ``FunctionType.Orchestration`` or a function
-        declared with ``level=..., role=Role.Orchestrator``; both forms set
-        the same ``role`` field on the IR Function). Callee-role validation
-        happens in :meth:`parse_call` via the ``allowed_kwargs`` filter
-        before this method runs, so by the time we reach this point the
-        kwarg is known to be legal. The parser is intentionally permissive
-        about the value form: any IR expression works. Downstream passes
-        (the comm-collection pass, simplify) inspect the resolved expression
-        and decide:
-
-        * ``ConstInt`` (literal or after simplify-time constant folding) →
-          fixed-device dispatch.
-        * IR Var that is a ``for``-loop induction variable with a known
-          range → device subset / kAll.
-        * Anything else → rejected by the comm-collection pass, with the
-          full def-use chain available for a good error message.
-
-        Returns:
-            The parsed IR expression, or ``None`` when ``device=`` is absent.
+        Top-level kwarg role validation happens before this method; placement
+        recovered from attrs is checked here. Keep expression parsing
+        permissive so downstream scope analysis can resolve loop variables and
+        folded constants with full def-use context. Reject competing sources
+        before merging attrs: choosing one silently can dispatch to a wrong child.
         """
-        device_kw = next((kw for kw in keywords if kw.arg == "device"), None)
-        if device_kw is None:
-            return None
-        return self.parse_expression(device_kw.value)
+        placement_kwargs = [kw for kw in keywords if kw.arg in {"worker", "device"}]
+        placement_attrs = [key for key in ("worker", "device") if key in extra_attrs]
+        if placement_attrs and (func_obj is None or func_obj.role != ir.Role.Orchestrator):
+            # Printed attrs must obey the same role restriction as worker=/device=.
+            # Otherwise a plain kernel call could acquire the dispatch-only layout
+            # exemption simply by hiding its placement metadata in attrs.
+            raise ParserTypeError(
+                f"Placement attrs {placement_attrs} require an Orchestrator callee",
+                span=func_obj.span if func_obj is not None else None,
+            )
+        if len(placement_kwargs) + len(placement_attrs) > 1:
+            raise ParserTypeError(
+                "Dispatch placement must use only one worker or device spelling, including attrs",
+                span=self.span_tracker.get_span(placement_kwargs[0].value) if placement_kwargs else None,
+            )
+        if placement_kwargs:
+            keyword = placement_kwargs[0]
+            if keyword.arg == "device":
+                warnings.warn(
+                    "device= is deprecated for dispatch; use worker= for the logical child selector",
+                    DeprecationWarning,
+                    stacklevel=3,
+                )
+            return self.parse_expression(keyword.value)
+        if placement_attrs:
+            return cast(ir.Expr, extra_attrs.pop(placement_attrs[0]))
+        return None
 
     def _effective_return_types(self, func: ir.Function | None) -> list[ir.Type]:
         """Effective callee return types for cross-function call type inference.
@@ -8429,7 +8438,7 @@ class ASTParser:
         no_dep_indices: list[int] | None = None,
         dump_vars: list[ir.Var] | None = None,
         user_dep_vars: list[ir.Var] | None = None,
-        device_expr: ir.Expr | None = None,
+        worker_expr: ir.Expr | None = None,
         augment_task_id: bool = False,
         core_num: ir.Expr | None = None,
         sync_start: bool = False,
@@ -8469,10 +8478,9 @@ class ASTParser:
                 ``augment_task_id=True`` — ManualDepsOnSubmitOnly invariant);
                 codegen emits a ``set_dependencies(arr, count)`` call built
                 from the entries (array entries expand to one slot each).
-            device_expr: Optional :class:`ir.Expr` from the ``device=`` kwarg
-                on an Orchestration dispatch call. Stored under
-                ``attrs['device']`` so the comm-collection pass can recover
-                per-dispatch device subsets without re-parsing the AST.
+            worker_expr: Logical immediate-child selector from ``worker=``
+                (or legacy ``device=``). Stored as a typed Expr under
+                ``attrs['worker']`` for scope analysis, SSA and codegen.
             augment_task_id: When True (``pl.submit(...)`` path), the call's
                 return type is wrapped as the flat
                 ``TupleType([*<callee returns>, Scalar[TASK_ID]])`` — elements
@@ -8513,9 +8521,9 @@ class ASTParser:
         if no_dep_indices:
             attrs = attrs or {}
             attrs["arg_direction_overrides"] = list(no_dep_indices)
-        if device_expr is not None:
+        if worker_expr is not None:
             attrs = attrs or {}
-            attrs["device"] = device_expr
+            attrs["worker"] = worker_expr
         # Generic round-trip attrs (e.g. arg_direction_overrides from a printed
         # attrs dict, dummy_task, future keys). setdefault so a value already
         # supplied by a dedicated param above wins — the two sources are
@@ -8829,6 +8837,15 @@ class ASTParser:
             span=self.span_tracker.get_span(first_node),
         )
 
+    def _parse_dispatch_attr_value(self, method_name: str, key: str, value_node: ast.expr) -> Any:
+        """Read placement as an Expr only in a dispatch-specific attrs context."""
+        if key in {"worker", "device"}:
+            # A dispatch selector is an SSA edge even when written as a literal.
+            # Function, loop and communication-scope metadata use the generic
+            # syntax-inferred reader and must not inherit this reserved meaning.
+            return self.parse_expression(value_node)
+        return self._parse_attr_value(method_name, key, value_node)
+
     def _extract_generic_call_attrs(
         self,
         method_name: str,
@@ -8853,7 +8870,7 @@ class ASTParser:
             key = key_node.value
             if key in bespoke:
                 continue
-            result[key] = self._parse_attr_value(method_name, key, value_node)
+            result[key] = self._parse_dispatch_attr_value(method_name, key, value_node)
         return result
 
     def _extract_arg_directions_from_attrs(
@@ -9247,7 +9264,9 @@ class ASTParser:
                 kwargs[key] = self.parse_expression(value)
         return kwargs
 
-    def _parse_op_attrs(self, call: ast.Call) -> dict[str, object] | None:
+    def _parse_op_attrs(
+        self, call: ast.Call, *, dispatch_placement: bool = False
+    ) -> dict[str, object] | None:
         """Extract a generic ``attrs={...}`` kwarg from an op call, if present.
 
         The python printer surfaces compiler-internal op-call attrs (e.g.
@@ -9270,10 +9289,14 @@ class ASTParser:
                     "op attrs must be a dict literal",
                     span=self.span_tracker.get_span(keyword.value),
                 )
-            return self._parse_generic_attrs_dict(ast.unparse(call.func), keyword.value)
+            return self._parse_generic_attrs_dict(
+                ast.unparse(call.func), keyword.value, dispatch_placement=dispatch_placement
+            )
         return None
 
-    def _parse_generic_attrs_dict(self, method_name: str, node: ast.Dict) -> dict[str, object]:
+    def _parse_generic_attrs_dict(
+        self, method_name: str, node: ast.Dict, *, dispatch_placement: bool = False
+    ) -> dict[str, object]:
         """Read an open-world ``attrs={...}`` dict literal via ``_parse_attr_value``.
 
         Only the string-literal-key invariant is enforced; each value's type is
@@ -9300,7 +9323,11 @@ class ASTParser:
                     "pl.system.task_dummy or pl.submit",
                     span=self.span_tracker.get_span(value_node),
                 )
-            result[key] = self._parse_attr_value(method_name, key, value_node)
+            result[key] = (
+                self._parse_dispatch_attr_value(method_name, key, value_node)
+                if dispatch_placement
+                else self._parse_attr_value(method_name, key, value_node)
+            )
         return result
 
     @staticmethod
@@ -9821,7 +9848,7 @@ class ASTParser:
         printer can write. Every ``builtin.*`` dispatch is built by one
         function (``MakeBuiltinCallWithAttrs`` in
         ``lower_host_tensor_collectives_pass.cpp``), which unconditionally
-        stamps a ``device`` attr and an ``arg_directions`` attr covering every
+        stamps a ``worker`` attr and an ``arg_directions`` attr covering every
         positional arg; orchestration codegen then reads both back behind
         internal checks. Hand-written source that omits them would be accepted
         here and blow up much later as an "internal error" — a compiler-bug
@@ -9850,7 +9877,7 @@ class ASTParser:
 
         args = [self.parse_expression(arg) for arg in call.args]
         kwargs = self._parse_op_kwargs(call)
-        attrs = self._parse_op_attrs(call) or {}
+        attrs = self._parse_op_attrs(call, dispatch_placement=True) or {}
         self._check_builtin_op_printer_invariants(full_name, args, attrs, span)
         try:
             built = ir._create_internal_op_call(full_name, args, kwargs, span)
@@ -9873,7 +9900,7 @@ class ASTParser:
         Keeps the accepted grammar equal to the printer's output, so this
         machine-only surface cannot be used to hand-build a dispatch that
         orchestration codegen would reject with an ``INTERNAL_CHECK`` (see
-        ``EmitBuiltinWindowCollectiveDispatch``: it requires a ``device`` attr
+        ``EmitBuiltinWindowCollectiveDispatch``: it requires a ``worker`` attr
         to resolve the rank expression, and one ``arg_directions`` entry per
         positional arg).
         """
@@ -9882,10 +9909,20 @@ class ASTParser:
             f"{full_name} is reached by writing the public pld.{full_name.split('.', 1)[1]} "
             f"collective and letting LowerHostTensorCollectives lower it"
         )
-        if "device" not in attrs:
+        if "worker" in attrs and "device" in attrs:
             raise InvalidOperationError(
-                f"'pl.{full_name}' requires a device attr naming the dispatching rank "
-                f'(attrs={{"device": <rank>}})',
+                f"'pl.{full_name}' must use only one worker or device placement attr",
+                span=span,
+                hint=hint,
+            )
+        if "device" in attrs:
+            # Read older printer dumps; constructors perform the same wire/direct
+            # IR normalization while preserving the referenced expression object.
+            attrs["worker"] = attrs.pop("device")
+        if "worker" not in attrs:
+            raise InvalidOperationError(
+                f"'pl.{full_name}' requires a worker attr naming the dispatching child "
+                f'(attrs={{"worker": <rank>}})',
                 span=span,
                 hint=hint,
             )

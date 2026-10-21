@@ -8,13 +8,12 @@
 # -----------------------------------------------------------------------------------------------------------
 # ruff: noqa: F722, F821
 
-"""Parser tests for the ``device=`` kwarg on Orchestration dispatch calls.
+"""Compatibility and canonical worker-placement tests for hierarchical dispatch.
 
-``self.<orch>(..., device=r)`` selects the physical device for a per-rank
-dispatch. The kwarg is only legal when the callee is an
-``ir.FunctionType.Orchestration`` function. The parser is intentionally
+``self.<orch>(..., device=r)`` is the deprecated spelling for a logical child
+dispatch. The kwarg is only legal when the callee is an orchestrator. The parser is intentionally
 permissive about the value form — any IR expression is parsed and stashed
-on ``call.attrs['device']``. Downstream passes (simplify, comm-collection)
+on ``call.attrs['worker']``. Downstream passes (simplify, comm-collection)
 inspect the resolved expression to derive the per-dispatch device subset:
 
 * ``ConstInt`` → fixed-device dispatch
@@ -23,10 +22,12 @@ inspect the resolved expression to derive the per-dispatch device subset:
   def-use context
 """
 
+import warnings
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
-from pypto.language.parser.diagnostics import ParserTypeError
+from pypto.language.parser.diagnostics import ParserError, ParserTypeError
 from pypto.pypto_core import ir
 
 
@@ -60,12 +61,12 @@ def _find_callee_call(func: ir.Function, callee_name: str) -> ir.Call:
 
 
 # ---------------------------------------------------------------------------
-# Positive cases — parser stashes the IR expression on ``call.attrs['device']``
+# Positive cases — parser stashes the IR expression on ``call.attrs['worker']``
 # ---------------------------------------------------------------------------
 
 
 def test_device_int_literal():
-    """``device=0`` lifts to a ConstInt stored on call.attrs['device']."""
+    """``device=0`` lifts to a ConstInt stored on call.attrs['worker']."""
 
     @pl.program
     class P:
@@ -80,7 +81,7 @@ def test_device_int_literal():
 
     func = _get_func(P, "host_orch")
     call = _find_callee_call(func, "chip_orch")
-    device = call.attrs["device"]
+    device = call.attrs["worker"]
     assert isinstance(device, ir.ConstInt)
     assert device.value == 0
 
@@ -102,7 +103,7 @@ def test_device_uses_for_loop_induction_var():
 
     func = _get_func(P, "host_orch")
     call = _find_callee_call(func, "chip_orch")
-    device = call.attrs["device"]
+    device = call.attrs["worker"]
     assert isinstance(device, ir.Var)
     assert device.name_hint == "r"
     assert isinstance(device.type, ir.ScalarType)
@@ -127,7 +128,7 @@ def test_device_accepts_locally_bound_constant():
 
     func = _get_func(P, "host_orch")
     call = _find_callee_call(func, "chip_orch")
-    device = call.attrs["device"]
+    device = call.attrs["worker"]
     # The parser hands back the Var; downstream simplify can fold it to
     # ConstInt(3) when the comm-collection pass needs a literal.
     assert isinstance(device, ir.Var)
@@ -152,7 +153,7 @@ def test_device_accepts_arithmetic_expression():
 
     func = _get_func(P, "host_orch")
     call = _find_callee_call(func, "chip_orch")
-    device = call.attrs["device"]
+    device = call.attrs["worker"]
     # Parser does not constrain shape — comm-collection pass will validate.
     assert isinstance(device, ir.Expr)
 
@@ -175,7 +176,7 @@ def test_device_accepts_explicit_level_role_orchestrator():
 
     func = _get_func(P, "host_orch")
     call = _find_callee_call(func, "chip_orch")
-    device = call.attrs["device"]
+    device = call.attrs["worker"]
     assert isinstance(device, ir.ConstInt)
     assert device.value == 2
 
@@ -201,6 +202,200 @@ def test_device_rejected_on_non_orchestrator_callee():
             def host_orch(self, x: pl.Tensor[[64], pl.FP32]):
                 self.kernel(x, device=0)
                 return 0
+
+
+def _parse_worker_dispatch(placement: str, *, submit: bool = False) -> tuple[ir.Program, ir.Expr]:
+    """Parse one HOST-to-CHIP launch using the public placement spelling."""
+    launch = (
+        f"result, task = pl.submit(self.chip_orch, x, {placement})"
+        if submit
+        else f"self.chip_orch(x, {placement})"
+    )
+    program = pl.parse_program(f"""
+import pypto.language as pl
+
+@pl.program
+class P:
+    @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+    def chip_orch(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+        return x
+
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def host_orch(self, x: pl.Tensor[[64], pl.FP32]):
+        for r in pl.range(4):
+            {launch}
+        return 0
+""")
+    launches: list[ir.Expr] = []
+
+    class FindLaunch(ir.IRVisitor):
+        def visit_call(self, op):
+            if isinstance(op.op, ir.GlobalVar) and op.op.name == "chip_orch":
+                launches.append(op)
+            super().visit_call(op)
+
+        def visit_submit(self, op):
+            if op.op.name == "chip_orch":
+                launches.append(op)
+            super().visit_submit(op)
+
+    FindLaunch().visit_program(program)
+    assert len(launches) == 1
+    return program, launches[0]
+
+
+@pytest.mark.parametrize("submit", [False, True], ids=["call", "submit"])
+@pytest.mark.parametrize(
+    ("placement", "expr_type"),
+    [
+        ("worker=0", ir.ConstInt),
+        ("worker=r", ir.Var),
+        ("worker=r + 1", ir.Add),
+        ('attrs={"worker": r}', ir.Var),
+    ],
+)
+def test_worker_dispatch_uses_canonical_expr_attr(submit, placement, expr_type):
+    """The child selector is a typed Expr on both call-like IR nodes."""
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always", DeprecationWarning)
+        program, launch = _parse_worker_dispatch(placement, submit=submit)
+    assert not [warning for warning in recorded if issubclass(warning.category, DeprecationWarning)]
+    assert isinstance(launch, ir.Submit if submit else ir.Call)
+    assert "device" not in launch.attrs
+    assert isinstance(launch.attrs["worker"], expr_type)
+    assert "worker" not in launch.kwargs
+    text = program.as_python()
+    assert "device=" not in text and '"device":' not in text
+    assert "__FREE_VAR" not in text
+    ir.assert_structural_equal(program, pl.parse_program(text))
+
+
+@pytest.mark.parametrize("submit", [False, True], ids=["call", "submit"])
+def test_worker_dispatch_device_alias_warns_and_normalizes(submit):
+    with pytest.warns(DeprecationWarning, match=r"device.*worker"):
+        _, launch = _parse_worker_dispatch("device=r", submit=submit)
+    assert "device" not in launch.attrs
+    assert isinstance(launch.attrs["worker"], ir.Var)
+    assert launch.attrs["worker"].name_hint == "r"
+
+
+@pytest.mark.parametrize("submit", [False, True], ids=["call", "submit"])
+def test_worker_dispatch_legacy_attrs_normalize(submit):
+    _, launch = _parse_worker_dispatch('attrs={"device": r}', submit=submit)
+    assert "device" not in launch.attrs
+    assert isinstance(launch.attrs["worker"], ir.Var)
+
+
+@pytest.mark.parametrize("submit", [False, True], ids=["call", "submit"])
+@pytest.mark.parametrize(
+    "placement",
+    [
+        "worker=0, device=0",
+        'worker=0, attrs={"device": 1}',
+        'device=0, attrs={"worker": 1}',
+        'worker=0, attrs={"worker": 1}',
+        'device=0, attrs={"device": 1}',
+        'attrs={"worker": 0, "device": 0}',
+    ],
+)
+def test_worker_dispatch_rejects_competing_placement_sources(submit, placement):
+    """Even equal aliases are ambiguous; attrs cannot silently override a kwarg."""
+    with pytest.raises(ParserError, match=r"worker|device"):
+        _parse_worker_dispatch(placement, submit=submit)
+
+
+def test_worker_dispatch_accepts_host_callee_metadata_at_cluster_level():
+    """Parsing uses hierarchy metadata; this does not assert POD codegen support."""
+    program = pl.parse_program("""
+import pypto.language as pl
+
+@pl.program
+class P:
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def host_orch(self, x: pl.Tensor[[64], pl.FP32]):
+        return x
+
+    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+    def pod_orch(self, x: pl.Tensor[[64], pl.FP32]):
+        self.host_orch(x, worker=0)
+        return 0
+""")
+    launch = _find_callee_call(_get_func(program, "pod_orch"), "host_orch")
+    assert "worker" in launch.attrs and "device" not in launch.attrs
+    assert launch.attrs["worker"].value == 0
+
+
+def test_worker_dispatch_preserves_ordinary_kernel_parameter_names():
+    """Positional scalar parameters called worker/device are ordinary values."""
+    program = pl.parse_program("""
+import pypto.language as pl
+
+@pl.program
+class P:
+    @pl.function
+    def kernel(self, worker: pl.Scalar[pl.INDEX], device: pl.Scalar[pl.INDEX]):
+        return worker + device
+
+    @pl.function
+    def caller(self, worker: pl.Scalar[pl.INDEX], device: pl.Scalar[pl.INDEX]):
+        result = self.kernel(worker, device)
+        return result
+""")
+    launch = _find_callee_call(_get_func(program, "caller"), "kernel")
+    assert not launch.attrs
+    assert [arg.name_hint for arg in launch.args] == ["worker", "device"]
+
+
+def _non_orchestrator_dispatch_source(attrs: str, *, submit: bool) -> str:
+    launch = (
+        f"out, task = pl.submit(self.kernel, x, attrs={attrs})"
+        if submit
+        else f"self.kernel(x, attrs={attrs})"
+    )
+    return f"""
+import pypto.language as pl
+
+@pl.program
+class P:
+    @pl.function
+    def kernel(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+        return x
+
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def host_orch(self, x: pl.Tensor[[64], pl.FP32]):
+        {launch}
+        return 0
+"""
+
+
+@pytest.mark.parametrize("submit", [False, True], ids=["call", "submit"])
+@pytest.mark.parametrize("key", ["worker", "device"])
+def test_worker_dispatch_attrs_reject_non_orchestrator_callee(submit, key):
+    """Machine attrs cannot bypass the role check on public placement kwargs."""
+    with pytest.raises(ParserTypeError, match=r"worker|device"):
+        pl.parse_program(_non_orchestrator_dispatch_source(f'{{"{key}": 0}}', submit=submit))
+
+
+@pytest.mark.parametrize("submit", [False, True], ids=["call", "submit"])
+def test_worker_dispatch_non_orchestrator_keeps_ordinary_custom_attrs(submit):
+    """Restrict placement metadata without closing the generic attr namespace."""
+    program = pl.parse_program(_non_orchestrator_dispatch_source('{"label": "ordinary"}', submit=submit))
+    launches: list[ir.Call | ir.Submit] = []
+
+    class FindLaunch(ir.IRVisitor):
+        def visit_call(self, op):
+            if isinstance(op.op, ir.GlobalVar) and op.op.name == "kernel":
+                launches.append(op)
+            super().visit_call(op)
+
+        def visit_submit(self, op):
+            if op.op.name == "kernel":
+                launches.append(op)
+            super().visit_submit(op)
+
+    FindLaunch().visit_program(program)
+    assert len(launches) == 1
+    assert dict(launches[0].attrs) == {"label": "ordinary"}
 
 
 if __name__ == "__main__":

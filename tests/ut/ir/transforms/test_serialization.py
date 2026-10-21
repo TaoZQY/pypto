@@ -1342,5 +1342,98 @@ class TestCachePolicyAttrSerialization:
         assert dict(mm.attrs)["cache_policy"] == [(1, 1)]
 
 
+def _worker_dispatch_ir(kind: str, attrs: dict[str, object]) -> ir.Call | ir.Submit:
+    """Keep placement, arguments, and dependency references independently visible."""
+    span = ir.Span.unknown()
+    scalar = ir.ScalarType(DataType.INDEX)
+    selector = ir.Var("selector", scalar, span)
+    resolved_attrs = {key: selector if value == "selector" else value for key, value in attrs.items()}
+    if kind == "call":
+        return ir.Call(ir.GlobalVar("chip"), [selector], {}, resolved_attrs, scalar, span)
+    dep = ir.Var("producer", ir.ScalarType(DataType.TASK_ID), span)
+    return ir.Submit(
+        ir.GlobalVar("chip"),
+        [selector, dep],
+        [dep],
+        {},
+        resolved_attrs,
+        ir.TupleType([scalar, ir.ScalarType(DataType.TASK_ID)]),
+        span,
+    )
+
+
+@pytest.mark.parametrize("kind", ["call", "submit"])
+@pytest.mark.parametrize("key", ["worker", "device"])
+def test_worker_dispatch_direct_ir_normalizes_placement(kind, key):
+    launch = _worker_dispatch_ir(kind, {key: "selector"})
+    assert set(launch.attrs) == {"worker"}
+    assert launch.attrs["worker"] is launch.args[0]
+
+
+@pytest.mark.parametrize("kind", ["call", "submit"])
+def test_worker_dispatch_direct_ir_rejects_alias_collision(kind):
+    with pytest.raises(ValueError, match=r"worker|device"):
+        _worker_dispatch_ir(kind, {"worker": "selector", "device": "selector"})
+
+
+@pytest.mark.parametrize("kind", ["call", "submit"])
+@pytest.mark.parametrize("legacy", [False, True], ids=["canonical", "legacy-literal-device"])
+def test_worker_dispatch_serialized_attr_preserves_expr_identity(kind, legacy):
+    launch = _worker_dispatch_ir(kind, {"worker": "selector"})
+    payload = ir.serialize(launch)
+    if legacy:
+        # Both MessagePack fixstr keys have six bytes. Change only the wire key,
+        # leaving the Expr node-reference encoding and all Var IDs untouched.
+        assert payload.count(b"\xa6worker") == 1
+        payload = payload.replace(b"\xa6worker", b"\xa6device")
+    restored = ir.deserialize(payload)
+    assert isinstance(restored, ir.Submit if kind == "submit" else ir.Call)
+    assert set(restored.attrs) == {"worker"}
+    assert restored.attrs["worker"] is restored.args[0]
+    if kind == "submit":
+        assert restored.deps[0] is restored.args[1]
+        assert restored.type.types[-1].dtype == DataType.TASK_ID
+    ir.assert_structural_equal(launch, restored, enable_auto_mapping=True)
+
+
+@pytest.mark.parametrize("kind", ["call", "submit"])
+def test_worker_dispatch_legacy_integer_payload_normalizes_to_expr(kind):
+    """Old direct IR could serialize device placement as scalar integer metadata."""
+    # Use an unreserved key so the current binding cannot pre-wrap the integer.
+    # The equal-length wire-key replacement models the actual legacy integer
+    # encoding while leaving argument and dependency node references untouched.
+    producer = _worker_dispatch_ir(kind, {"legacy": 3})
+    payload = ir.serialize(producer)
+    assert payload.count(b"\xa6legacy") == 1
+    payload = payload.replace(b"\xa6legacy", b"\xa6device")
+
+    restored = ir.deserialize(payload)
+    assert isinstance(restored, ir.Submit if kind == "submit" else ir.Call)
+    assert set(restored.attrs) == {"worker"}
+    worker = restored.attrs["worker"]
+    assert isinstance(worker, ir.ConstInt)
+    assert worker.value == 3
+    assert worker.dtype == DataType.INDEX
+    assert restored.args[0].name_hint == "selector"
+    if kind == "submit":
+        assert restored.deps[0] is restored.args[1]
+        assert restored.type.types[-1].dtype == DataType.TASK_ID
+
+
+def test_worker_dispatch_does_not_reinterpret_ordinary_operator_kwargs():
+    span = ir.Span.unknown()
+    call = ir.Call(
+        ir.Op("ordinary_operator"),
+        [],
+        {"worker": 3, "device": 12},
+        {},
+        ir.ScalarType(DataType.INDEX),
+        span,
+    )
+    restored = ir.deserialize(ir.serialize(call))
+    assert dict(restored.kwargs) == {"worker": 3, "device": 12}
+    assert not restored.attrs
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])

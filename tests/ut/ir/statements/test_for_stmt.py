@@ -827,5 +827,31 @@ class TestForStmtIterArgMutatorRemap:
         ir.assert_structural_equal(After, Expected)
 
 
+@pytest.mark.parametrize("key", ["worker", "device"])
+def test_worker_dispatch_does_not_coerce_ordinary_loop_integer_attrs(key):
+    """A generic loop attr must remain scalar metadata readable by its binding."""
+    span = ir.Span.unknown()
+    index = ir.Var("i", ir.ScalarType(DataType.INDEX), span)
+    zero = ir.ConstInt(0, DataType.INDEX, span)
+    loop = ir.ForStmt(
+        index,
+        zero,
+        ir.ConstInt(4, DataType.INDEX, span),
+        ir.ConstInt(1, DataType.INDEX, span),
+        [],
+        ir.EvalStmt(zero, span),
+        [],
+        span,
+        attrs={key: 7},
+    )
+    assert type(loop.attrs[key]) is int
+    assert dict(loop.attrs) == {key: 7}
+
+    restored = ir.deserialize(ir.serialize(loop))
+    assert type(restored.attrs[key]) is int
+    assert dict(restored.attrs) == {key: 7}
+    ir.assert_structural_equal(loop, restored, enable_auto_mapping=True)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

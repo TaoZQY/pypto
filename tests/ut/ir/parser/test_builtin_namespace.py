@@ -105,9 +105,9 @@ def test_builtin_op_carries_machine_only_attrs():
     ]
     assert len(barriers) == 1
     call = barriers[0]
-    assert set(call.attrs.keys()) == {"device", "arg_directions"}
-    assert isinstance(call.attrs["device"], ir.Var)
-    assert call.attrs["device"].name_hint == "r"
+    assert set(call.attrs.keys()) == {"worker", "arg_directions"}
+    assert isinstance(call.attrs["worker"], ir.Var)
+    assert call.attrs["worker"].name_hint == "r"
     assert list(call.attrs["arg_directions"]) == [ir.ArgDirection.InOut]
 
 
@@ -148,7 +148,7 @@ def test_builtin_op_reports_deduction_failures_against_its_own_name():
 def test_hand_written_builtin_call_without_device_is_a_user_error():
     """A bare `pl.builtin.tensor.barrier(signal)` is rejected at parse time.
 
-    Orchestration codegen resolves the dispatching rank from the `device` attr
+    Orchestration codegen resolves the dispatching rank from the `worker` attr
     behind an `INTERNAL_CHECK`, so accepting a hand-written call without it
     would turn bad user input into a compiler-bug diagnostic much later. The
     printer always stamps the attr, so requiring it costs the round-trip
@@ -156,7 +156,7 @@ def test_hand_written_builtin_call_without_device_is_a_user_error():
     """
     with pytest.raises(InvalidOperationError) as excinfo:
         pl.parse_program(_barrier_program("pl.builtin.tensor.barrier(signal)"))
-    assert "device" in str(excinfo.value)
+    assert "worker" in str(excinfo.value)
     assert excinfo.value.hint is not None
     assert "pld.tensor.barrier" in excinfo.value.hint
 
@@ -196,6 +196,39 @@ def test_public_collective_still_lowers_through_pld_surface():
     }
     assert _BUILTIN_BARRIER not in op_names
     assert ir.get_op("pld.tensor.barrier").name in op_names
+
+
+@pytest.mark.parametrize("key", ["worker", "device"])
+def test_worker_dispatch_builtin_attrs_roundtrip_to_canonical_key(key):
+    """Printed builtins use worker; old dumps remain readable by explicit normalization."""
+    call = f'pl.builtin.tensor.barrier(signal, attrs={{"{key}": r, "arg_directions": [pl.adir.inout]}})'
+    program = pl.parse_program(_barrier_program(call))
+    host = _get_func(program, "host_orch")
+    loop = next(stmt for stmt in _iter_stmts(host.body) if isinstance(stmt, ir.ForStmt))
+    barrier = next(
+        stmt.expr
+        for stmt in _iter_stmts(loop.body)
+        if isinstance(stmt, ir.EvalStmt)
+        and isinstance(stmt.expr, ir.Call)
+        and stmt.expr.op.name == _BUILTIN_BARRIER
+    )
+    assert set(barrier.attrs) == {"worker", "arg_directions"}
+    assert barrier.attrs["worker"] is loop.loop_var
+    text = program.as_python()
+    assert '"worker":' in text
+    assert '"device":' not in text
+    assert "__FREE_VAR" not in text
+    ir.assert_structural_equal(program, pl.parse_program(text))
+
+
+def test_worker_dispatch_builtin_rejects_both_placement_keys():
+    with pytest.raises(InvalidOperationError, match=r"worker|device"):
+        pl.parse_program(
+            _barrier_program(
+                'pl.builtin.tensor.barrier(signal, attrs={"worker": r, "device": r, '
+                '"arg_directions": [pl.adir.inout]})'
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -494,5 +494,21 @@ class TestProloguePlacementAndValueShapes:
         ir.assert_structural_equal(pl.parse_program(ir.python_print(P)), P)
 
 
+@pytest.mark.parametrize("key", ["worker", "device"])
+@pytest.mark.parametrize("value", [7, "ordinary"], ids=["integer", "string"])
+def test_worker_dispatch_names_remain_generic_in_function_attr_prologue(key, value):
+    """Function attrs retain their original syntax-inferred scalar type and key."""
+    program = pl.parse_program(_source(f'pl.func_attr({{"{key}": {value!r}}})'))
+    attrs = dict(_function(program).attrs)
+    assert type(attrs[key]) is type(value)
+    assert attrs == {key: value}
+
+    reparsed = pl.parse_program(program.as_python())
+    restored_attrs = dict(_function(reparsed).attrs)
+    assert type(restored_attrs[key]) is type(value)
+    assert restored_attrs == {key: value}
+    ir.assert_structural_equal(program, reparsed)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
