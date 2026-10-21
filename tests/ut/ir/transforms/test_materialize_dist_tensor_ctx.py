@@ -10,6 +10,7 @@
 
 """Tests for ``MaterializeDistTensorCtx``."""
 
+import pypto
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
@@ -737,13 +738,15 @@ def test_device_get_comm_ctx_is_replaced_by_materialized_context():
 # The one Before below is hand-built rather than DSL-authored, and deliberately
 # so: the program under test is one the DSL frontend refuses to author. It
 # allocates a window inside a *chip* orchestration function, and the parser
-# rejects ``pld.alloc_window_buffer`` outside HOST orchestration with its own
-# diagnostic — which is a different error from the pass-level one this test
-# pins. Reaching pass 46 with that shape therefore requires raw ``ir.*``.
+# rejects ``pld.alloc_window_buffer`` outside HOST/CLUSTER_0 orchestration with
+# its own diagnostic. Native verification now rejects the same invalid IR before
+# the pass; disabling instrumentation separately pins the materializer's error.
+# Constructing that unsupported shape therefore requires raw ``ir.*``.
 # ---------------------------------------------------------------------------
 
 
-def test_device_call_without_materialized_context_rejects_synthesized_prefix():
+@pytest.mark.parametrize("instrumented", [False, True])
+def test_device_call_without_materialized_context_rejects_synthesized_prefix(instrumented):
     span = ir.Span("test_materialize_dist_tensor_ctx.py", 1, 1)
     data_ty = ir.DistributedTensorType([4], pl.FP32)
 
@@ -799,10 +802,17 @@ def test_device_call_without_materialized_context_rejects_synthesized_prefix():
     )
 
     program = ir.Program([predicate, main], "unsupported_prefix_context", span)
-    # A user-facing limitation, not an internal invariant: the message must name
-    # the tensor and the function, and say what to change.
-    with pytest.raises(ValueError, match="Cannot determine the communication context"):
-        passes.materialize_dist_tensor_ctx()(program)
+    instruments = (
+        [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)] if instrumented else []
+    )
+    error_type = pypto.Error if instrumented else ValueError
+    match = "Pre-verification failed" if instrumented else "Cannot determine the communication context"
+    with passes.PassContext(instruments, verification_level=passes.VerificationLevel.NONE):
+        with pytest.raises(error_type, match=match) as excinfo:
+            passes.materialize_dist_tensor_ctx()(program)
+    if instrumented:
+        assert "DistributedOperationContext" in str(excinfo.value)
+        assert "pld.tensor.alloc_window_buffer" in str(excinfo.value)
 
 
 def test_submit_prefix_runtime_out_keeps_ctx_after_passed_args():
