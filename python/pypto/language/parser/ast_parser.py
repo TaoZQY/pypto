@@ -75,6 +75,20 @@ if TYPE_CHECKING:
 # / tile_ops); also surfaced as the hint in _parse_pld_category_op.
 _PLD_CATEGORIES: frozenset[str] = frozenset({"system", "tensor", "tile"})
 
+# Resolve callable aliases once, then validate the operation produced by the
+# wrapper. Looking up a callable here does not decide its IR operator identity.
+_DISTRIBUTED_DSL_CALLABLES = {
+    getattr(module, name): (module, prefix, name)
+    for module, prefix in (
+        (_dsl_pld, "pld"),
+        (_dsl_pld.system, "pld.system"),
+        (_dsl_pld.tensor, "pld.tensor"),
+        (_dsl_pld.tile, "pld.tile"),
+    )
+    for name in module.__all__
+    if callable(getattr(module, name))
+}
+
 # ``pl.func_attr({...})`` — the body-prologue directive carrying function-level
 # attributes. Body position is what lets an attribute reference a parameter: a
 # decorator is evaluated before the signature binds any name.
@@ -800,6 +814,9 @@ class ASTParser:
         # Track loop kinds for break/continue validation
         self._loop_kind_stack: list[str] = []
         self._scope_kind_stack: list[ir.ScopeKind] = []
+        # Membership queries run at every parsed call. Index active kinds so
+        # generic nesting does not multiply that work by the scope depth.
+        self._scope_kind_depths: dict[ir.ScopeKind, int] = {}
         # Set while parsing the body of an InCore scope the user declared with an
         # explicit ``optimizations=[pl.split(MODE)]`` — MODE included when it is
         # ``NONE``. ``InCoreScopeStmt.split_`` cannot answer this: it has a single
@@ -868,6 +885,8 @@ class ASTParser:
         # Current function level (set during parse_function). Drives
         # context-scoped op constraints (e.g. pld.system.world_size is host-only).
         self._func_level: ir.Level | None = None
+        self._distributed_level: ir.Level | None = None
+        self._distributed_role: ir.Role | None = None
         # Current function type (set during parse_function). Used by markers
         # whose validity is scoped to a specific function type — e.g.
         # ``pl.dump_tag`` only makes sense in Orchestration functions.
@@ -942,14 +961,45 @@ class ASTParser:
     def _scope_kind_context(self, scope_kind: ir.ScopeKind) -> Iterator[None]:
         """Track scope nesting during parsing for context-sensitive validation."""
         self._scope_kind_stack.append(scope_kind)
+        self._scope_kind_depths[scope_kind] = self._scope_kind_depths.get(scope_kind, 0) + 1
         try:
             yield
         finally:
             self._scope_kind_stack.pop()
+            # Repeated kinds remain active until their outermost occurrence
+            # exits, including when parsing unwinds because of a diagnostic.
+            remaining = self._scope_kind_depths[scope_kind] - 1
+            if remaining:
+                self._scope_kind_depths[scope_kind] = remaining
+            else:
+                del self._scope_kind_depths[scope_kind]
 
     def _is_inside_scope(self, scope_kind: ir.ScopeKind) -> bool:
         """Return whether parsing is currently nested inside the given scope kind."""
-        return scope_kind in self._scope_kind_stack
+        return self._scope_kind_depths.get(scope_kind, 0) > 0
+
+    @contextmanager
+    def _distributed_hierarchy_context(
+        self, scope_kind: ir.ScopeKind, level: ir.Level | None, role: ir.Role | None
+    ) -> Iterator[None]:
+        """Only hierarchy regions replace the effective distributed context."""
+        saved = self._distributed_level, self._distributed_role
+        if scope_kind == ir.ScopeKind.Hierarchy:
+            self._distributed_level, self._distributed_role = level, role
+        try:
+            yield
+        finally:
+            self._distributed_level, self._distributed_role = saved
+
+    def _validate_distributed_op_context(self, op: ir.Op, span: ir.Span) -> None:
+        in_device_scope = self._func_type in self._GRAPH_FORBIDDEN_FUNC_TYPES or any(
+            self._is_inside_scope(kind) for kind in (ir.ScopeKind.InCore, ir.ScopeKind.Spmd)
+        )
+        message = ir._distributed_op_context_error(
+            op, self._distributed_level, self._distributed_role, in_device_scope
+        )
+        if message:
+            raise ParserSyntaxError(message, span=span)
 
     @contextmanager
     def _incore_user_split_context(
@@ -1123,6 +1173,8 @@ class ASTParser:
         self.type_resolver.register_window_definitions(func_def)
         self._func_name = func_name
         self._func_level = func_level
+        self._distributed_level = func_level
+        self._distributed_role = func_role
         # auto_scope rides in func_attrs; absent ⇒ default True.
         self._func_auto_scope = bool((func_attrs or {}).get(AUTO_SCOPE_ATTR, True))
         self._func_type = func_type
@@ -2426,7 +2478,7 @@ class ASTParser:
         Parser-only concerns (everything else delegates to the DSL wrapper /
         IR builder / C++ deducer via :func:`invoke_dsl`):
 
-        - HOST-only, like ``world_size`` (see ``_validate_pld_op_call``): the
+        - Orchestration-only (HOST or CLUSTER_0): the
           window buffer is a host-orchestration resource, not lowerable inside
           InCore / SPMD scopes.
         - LHS must be a single ``ast.Name``.
@@ -2436,18 +2488,9 @@ class ASTParser:
         span = self.span_tracker.get_span(value)
         is_printed = _is_dump_call(value, "alloc_window_buffer")
 
-        in_device_scope = any(
-            self._is_inside_scope(kind) for kind in (ir.ScopeKind.InCore, ir.ScopeKind.Spmd)
-        )
-        if not is_printed and (self._func_level != ir.Level.HOST or in_device_scope):
-            raise ParserSyntaxError(
-                "pld.tensor.alloc_window_buffer() can only be called in HOST orchestration "
-                "context (not inside InCore / SPMD scopes); "
-                f"current function level: {self._func_level}",
-                span=span,
-                hint="Use '@pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)' "
-                "on the enclosing function and call outside any nested device-side scope",
-            )
+        # Printed assignments bypass parse_call, but their recorded ABI fields
+        # do not exempt the operation from the same execution-context rule.
+        self._validate_distributed_op_context(ir.get_op("pld.tensor.alloc_window_buffer"), span)
 
         if not isinstance(target, ast.Name):
             raise ParserSyntaxError(
@@ -5787,6 +5830,7 @@ class ASTParser:
             with (
                 self._scope_kind_context(scope_kind),
                 self._incore_user_split_context(scope_kind, split),
+                self._distributed_hierarchy_context(scope_kind, level, role),
             ):
                 self.scope_manager.enter_scope("scope")
                 self._parse_body_siblings(stmt.body)
@@ -6962,6 +7006,15 @@ class ASTParser:
         )
 
     def parse_call(self, call: ast.Call) -> ir.Expr:
+        # Each parsed call validates only its newly built root. Its argument
+        # calls were checked while parsing them; rescanning their IR subtrees
+        # here would make deeply nested source expressions quadratic.
+        result = self._parse_call_impl(call)
+        if isinstance(result, (ir.Call, ir.Submit)):
+            self._validate_distributed_op_context(result.op, self.span_tracker.get_span(call))
+        return result
+
+    def _parse_call_impl(self, call: ast.Call) -> ir.Expr:
         """Parse function call.
 
         Args:
@@ -6971,6 +7024,14 @@ class ASTParser:
             IR expression from call
         """
         func = call.func
+
+        # Imported functions, callable aliases, and module aliases all dispatch
+        # through the same wrapper. Restrict resolution to known DSL callables.
+        resolved = self._resolve_distributed_callable(func)
+        if resolved is not None:
+            module, prefix, name = resolved
+            self._validate_pld_op_call(name, call)
+            return self._dispatch_op(module, prefix, name, call)
 
         if _is_dump_call(call):
             return self._parse_dump_call(call)
@@ -7027,6 +7088,20 @@ class ASTParser:
             hint="Use pl.* operations, pl.yield_(), self.method() for cross-function calls, "
             "or call an external @pl.function / @pl.inline by name",
         )
+
+    def _resolve_distributed_callable(self, node: ast.expr) -> tuple[Any, str, str] | None:
+        segments = []
+        while isinstance(node, ast.Attribute):
+            segments.append(node.attr)
+            node = node.value
+        if not isinstance(node, ast.Name):
+            return None
+        value = self.expr_evaluator.closure_vars.get(node.id)
+        for segment in reversed(segments):
+            value = getattr(value, segment, None)
+        if not callable(value):
+            return None
+        return _DISTRIBUTED_DSL_CALLABLES.get(value)
 
     def _parse_recorded_call(self, call: ast.Call) -> ir.Call:
         """Restore a Call snapshot without repeating type inference."""
@@ -9751,7 +9826,8 @@ class ASTParser:
 
         - ``alloc_window_buffer``: must be intercepted at assignment-LHS.
           Reaching here means it was used outside that context.
-        - ``world_size``: host-only.
+        Resolved operation context is checked by ``parse_call`` instead of the
+        user's spelling, so aliases and private printer paths share the rule.
         """
         span = self.span_tracker.get_span(call)
 
@@ -9763,20 +9839,6 @@ class ASTParser:
                 hint="Write 'buf = pld.tensor.alloc_window_buffer(N)' "
                 "(or the short form 'buf = pld.alloc_window_buffer(N)')",
             )
-
-        if op_name == "world_size":
-            in_device_scope = any(
-                self._is_inside_scope(kind) for kind in (ir.ScopeKind.InCore, ir.ScopeKind.Spmd)
-            )
-            if self._func_level != ir.Level.HOST or in_device_scope:
-                raise ParserSyntaxError(
-                    "pld.system.world_size() can only be called in HOST orchestration context "
-                    "(not inside InCore / SPMD scopes); "
-                    f"current function level: {self._func_level}",
-                    span=span,
-                    hint="Use '@pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)' "
-                    "on the enclosing function and call outside any nested device-side scope",
-                )
 
     def _parse_pld_op(self, op_name: str, call: ast.Call) -> ir.Expr:
         """Parse ``pld.<op>(...)`` — 2-segment unified short form.

@@ -38,6 +38,43 @@ There are **fifteen ops** and **four ABI enums**:
 The seven side-effect-only ops produce [`UnknownType`](ir/02-types.md): they
 exist for their cross-rank effect, not for an SSA value a consumer reads.
 
+## Orchestration worker counts and operation legality
+
+`pld.num_workers()` / `pld.system.num_workers()` is a zero-argument INT64
+query for the current orchestrator's immediate children: local devices at
+HOST, nodes at CLUSTER_0. It does not report a communication domain's global
+rank count. `pld.world_size()` keeps its HOST local-device-count semantics.
+Both queries reject device functions and nested InCore/SPMD regions, and
+`world_size` additionally rejects CLUSTER_0.
+
+The parser validates the resolved operation with
+`op_predicates::DistributedOpContextError`, also exposed through an internal
+native binding. Callable/module aliases, builtin collective dispatches, and
+private printer forms therefore use the same rules. Each newly parsed root is
+checked once; argument subtrees are not rescanned. The TypeChecked verifier
+uses the same helper in a linear function traversal, including Call and Submit
+nodes constructed directly or restored from serialized IR. Hierarchy regions
+replace and restore the effective level/role; runtime and communication-domain
+regions preserve them. Standalone `LowerCompositeOps` checks these contexts
+before deferring managed collectives.
+
+CLUSTER_0 permits window allocation and view creation, but rejects tensor
+collectives, internal builtin collective dispatches, and tile/tensor remote
+communication. Put communication in a HOST or device body and dispatch it from
+the cluster orchestrator. Existing generic hierarchy codegen remains available.
+The CLUSTER_0 `num_workers` query raises an unsupported-lowering diagnostic
+rather than substituting HOST's local worker count for the node count. The
+cluster entry and runner support needed for executable cluster programs is
+still pending; this change provides frontend/IR support for the new query.
+
+HOST codegen lowers `num_workers` to its existing `world_size` binding. The
+communication-domain analysis recognizes direct and SSA-aliased bounds from
+either count query. A dynamic full-coverage loop must prove `start == 0` and
+`step == 1`; nonzero or unproven starts and nonunit or unproven steps are
+rejected. Constant unit-step subset ranges retain their existing nonzero-start
+behavior. Bound aliases are memoized per function, and active induction
+variables are indexed, avoiding repeated alias-chain and loop-stack scans.
+
 ## Namespacing: why `tile.*` vs `tensor.*` vs `system.*`
 
 The namespace encodes the IR level the op lives at, not an arbitrary grouping:

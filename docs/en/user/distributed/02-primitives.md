@@ -22,20 +22,36 @@ lower-level primitives only when building a custom protocol.
 ## System Substrate (`pld.system.*`)
 
 These are the lowest-level distributed primitives. Scope varies per op —
-`world_size` is host-only; `get_comm_ctx` works in both host orchestrator and
+`num_workers` queries immediate children in HOST/CLUSTER_0 orchestration;
+`world_size` is HOST-only; `get_comm_ctx` works in both host orchestrator and
 InCore kernel code; `rank`, `nranks`, `notify`, `wait`, and `defer_wait` have codegen
 support only in InCore kernel code (there is no host-orchestrator lowering
 for them).
 
 | Name | Signature | Description |
 | ---- | --------- | ----------- |
-| `world_size` | `() -> Scalar` | **Host-only.** Number of ranks in the distributed execution. Returns `INT64`. |
+| `num_workers` | `() -> Scalar` | **Orchestration-only.** Local devices at HOST; nodes at CLUSTER_0. Returns `INT64`. |
+| `world_size` | `() -> Scalar` | **HOST-only.** Number of local devices; preserved for existing HOST programs. Returns `INT64`. |
 | `get_comm_ctx` | `(dist_tensor: DT) -> Ctx` | Lift a `DistributedTensor` to its `CommCtx` handle. Works in host orchestrator and InCore code. The verifier rejects plain `pl.Tensor`. |
 | `rank` | `(ctx: Ctx) -> Scalar` | **InCore-only.** Local rank index (`INT32`). Lowers to a load of `CommContext::rankId`. |
 | `nranks` | `(ctx: Ctx) -> Scalar` | **InCore-only.** Number of ranks in this comm group (`INT32`). Lowers to a load of `CommContext::rankNum`. |
 | `notify` | `(target: DT, peer: IntLike, offsets: Sequence[IntLike], value: IntLike, *, op: NotifyOp) -> Call` | **InCore-only.** Cross-rank signal deposit. **Side-effect-only** — no return value. Lowers to `TNOTIFY`. |
 | `wait` | `(signal: DT, offsets: Sequence[IntLike], expected: IntLike, *, cmp: WaitCmp) -> Call` | **InCore-only.** Cross-rank wait. **Side-effect-only** — blocks until the local signal slot satisfies `cmp(expected)`. Lowers to `TWAIT`. |
 | `defer_wait` | `(signal: DT, offsets: Sequence[IntLike], expected: IntLike, *, cmp: WaitCmp) -> Call` | **Dedicated top-level `pl.at(CORE_GROUP)` waiter only.** Registers `signal[offsets] >= expected` as a completion condition and returns without spinning the AIV. The enclosing task's TaskId remains incomplete until the condition is ready. |
+
+Neither count query is legal in InCore/SPMD regions. `num_workers` is an
+immediate-child count, not a global communication-domain rank count. HOST loops
+such as `pl.range(pld.num_workers())` cover all local workers; with a dynamic
+count bound, the start must be zero and the step must be one, including when
+the bound is assigned through temporary variables.
+
+CLUSTER_0 supports parsing the new query and IR window allocation/view creation.
+Lowering `num_workers` at that level reports unsupported until cluster entry
+and runner support is available; existing generic hierarchy codegen is
+preserved. CLUSTER_0 rejects `world_size`, collectives, and remote communication,
+including aliases and internal builtin forms. Put those communication operations in lower-level
+HOST/device functions. Nested hierarchy regions select their own effective
+level and restore the enclosing context when they exit.
 
 ## Window Buffer Management (`pld.tensor.*`)
 

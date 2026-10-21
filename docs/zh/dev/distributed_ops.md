@@ -63,6 +63,35 @@ SSA 值而存在。
   `wait` 阻塞后在原 kernel 内恢复；`defer_wait` 返回并把就绪判断转交给 scheduler
   TaskId。
 
+## 编排 worker 数量与操作合法性
+
+`pld.num_workers()` / `pld.system.num_workers()` 是无参数、返回 INT64 的查询，
+表示当前编排器的直接子节点数量：HOST 返回本节点设备数，CLUSTER_0 返回节点数。
+它不表示通信域的全局 rank 数。`pld.world_size()` 保持 HOST 本节点设备数语义。
+两种查询都禁止出现在设备函数和嵌套 InCore/SPMD 区域中；`world_size` 还禁止在
+CLUSTER_0 使用。
+
+解析器通过原生内部绑定调用 `op_predicates::DistributedOpContextError`，检查
+解析后实际算子的身份。因此函数/模块别名、builtin 集合通信和打印器私有形式使用
+同一套规则。每个新解析的根节点只检查一次，不重复遍历实参子树。TypeChecked
+验证器复用该规则，在线性函数遍历中检查 Call 与 Submit，包括直接构造或反序列化
+恢复的 IR。Hierarchy 区域替换有效 level/role，并在退出时恢复；runtime 和通信域
+区域保留当前上下文。独立调用 `LowerCompositeOps` 时也会先验证上下文，再决定
+是否推迟 managed collective 的展开。
+
+CLUSTER_0 允许分配窗口和创建视图，但拒绝 tensor 集合通信、内部 builtin 集合
+通信和 tile/tensor 远程通信。通信应放入 HOST 或设备端函数，再由集群编排器下发。
+已有通用 hierarchy 代码生成仍可使用。CLUSTER_0 的 `num_workers` 查询会明确报
+该查询的 lowering 尚不支持，不能把 HOST 本节点 worker 数错误地当成集群节点数。
+可执行集群程序需要的集群入口与 runner 支持仍待实现；本次仅提供新查询的前端与
+IR 支持。
+
+HOST 代码生成把 `num_workers` 降为已有 `world_size` 绑定。通信域分析识别两种
+查询作为直接或经 SSA 别名传递的循环上界。动态全覆盖循环必须能证明
+`start == 0` 且 `step == 1`；非零或无法证明的起点、非单位或无法证明的步长都会
+报错。静态上界、单位步长的子集循环保留原有非零起点语义。函数内缓存别名解析结果，
+并索引当前循环变量，避免重复扫描别名链和循环栈。
+
 ## 混合 kernel 中的核放置
 
 `ExpandMixedKernel` 使用 `core_affinity::ClassifyCallAffinity` 把混合 InCore 函数

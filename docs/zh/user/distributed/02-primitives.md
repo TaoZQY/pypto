@@ -22,13 +22,25 @@
 
 | 名称 | 签名 | 描述 |
 | ---- | ---- | ---- |
-| `world_size` | `() -> Scalar` | **仅限 host。** 分布式执行中的 rank 数量。 |
+| `num_workers` | `() -> Scalar` | **仅限编排上下文。** HOST 返回本节点设备数；CLUSTER_0 返回节点数。返回 `INT64`。 |
+| `world_size` | `() -> Scalar` | **仅限 HOST。** 本节点设备数，保留既有 HOST 程序的语义。返回 `INT64`。 |
 | `get_comm_ctx` | `(dist_tensor: DT) -> Ctx` | 提升为 `CommCtx` 句柄。host 编排器和 InCore 代码均可用。 |
 | `rank` | `(ctx: Ctx) -> Scalar` | **仅限 InCore。** 本地 rank 索引。 |
 | `nranks` | `(ctx: Ctx) -> Scalar` | **仅限 InCore。** 通信组中 rank 数量。 |
 | `notify` | `(target, peer, offsets, value, *, op) -> Call` | **仅限 InCore。** 跨 rank 信号投递。仅副作用。 |
 | `wait` | `(signal, offsets, expected, *, cmp) -> Call` | **仅限 InCore。** 跨 rank 等待。仅副作用。 |
 | `defer_wait` | `(signal, offsets, expected, *, cmp) -> Call` | **仅限专用的顶层 `pl.at(CORE_GROUP)` waiter。** 注册 `signal[offsets] >= expected` 完成条件并返回，不让 AIV 自旋；条件满足前，所在任务的 TaskId 保持未完成。 |
+
+两种数量查询都不能在 InCore/SPMD 区域中调用。`num_workers` 表示直接子节点数量，
+不是全局通信域的 rank 数。HOST 中的 `pl.range(pld.num_workers())` 覆盖所有本地
+worker；动态数量作为上界时，循环起点必须为零、步长必须为一，经临时变量传递
+上界时也适用。
+
+CLUSTER_0 支持解析新查询与 IR 窗口分配/视图创建。集群入口与 runner 尚待实现，
+在此之前，该层的 `num_workers` 查询 lowering 会明确报不支持；已有通用 hierarchy
+代码生成保持可用。该层拒绝 `world_size`、集合通信和远程通信，函数别名与内部
+builtin 形式也不能绕过限制。通信应放入下层 HOST/设备函数。嵌套 hierarchy 区域使用自己的有效
+层级，并在退出后恢复外层上下文。
 
 ## Window Buffer 管理 (`pld.tensor.*`)
 

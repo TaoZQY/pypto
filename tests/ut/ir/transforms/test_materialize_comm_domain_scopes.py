@@ -2241,5 +2241,48 @@ def test_signed_scope_attribute_roundtrip(value):
     assert scope.attrs["index_expr"].value == -1
 
 
+def _c1b_dynamic_dispatch_program(query, *, hoisted=False, start="0", step="1"):
+    bound = "n_alias" if hoisted else f"pld.{query}()"
+    hoist = f"        n = pld.{query}()\n        n_alias = n\n" if hoisted else ""
+    return pl.parse_program(
+        "import pypto.language as pl\n"
+        "import pypto.language.distributed as pld\n"
+        "@pl.program\nclass P:\n"
+        "    @pl.function(type=pl.FunctionType.Orchestration)\n"
+        "    def chip(self, data: pld.DistributedTensor[[256], pl.FP32]):\n"
+        "        return data\n"
+        "    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)\n"
+        "    def host(self, begin: pl.Scalar[pl.INT64], stride: pl.Scalar[pl.INT64]):\n"
+        "        buf = pld.alloc_window_buffer(1024)\n"
+        "        data = pld.window(buf, [256], dtype=pl.FP32)\n"
+        f"{hoist}"
+        f"        for r in pl.range({start}, {bound}, {step}):\n"
+        "            self.chip(data, worker=r)\n"
+        "        return 0\n"
+    )
+
+
+@pytest.mark.parametrize("hoisted", [False, True])
+def test_c1b_num_workers_full_coverage_loop(hoisted):
+    # ConvertToSSA runs inside _apply; both direct and aliased bounds must resolve.
+    program = _apply(_c1b_dynamic_dispatch_program("num_workers", hoisted=hoisted))
+    scopes = _get_comm_domain_scopes(_get_func(program, "host"))
+    assert len(scopes) == 1
+    assert list(scopes[0].devices) == []
+    assert len(scopes[0].slots) == 1
+    assert _view_var_types(_get_func(program, "host"))[0].window_buffer is scopes[0].slots[0]
+
+
+@pytest.mark.parametrize("query", ["world_size", "num_workers"])
+@pytest.mark.parametrize("hoisted", [False, True])
+@pytest.mark.parametrize(("start", "step"), [("1", "1"), ("0", "2"), ("begin", "1"), ("0", "stride")])
+def test_c1b_dynamic_full_coverage_requires_zero_start_unit_step(query, hoisted, start, step):
+    # A dynamic stop alone proves no coverage: skipping rank zero or striding
+    # cannot allocate an all-workers domain. Dynamic starts/steps are unproven too.
+    before = _c1b_dynamic_dispatch_program(query, hoisted=hoisted, start=start, step=step)
+    with pytest.raises(ValueError, match="start|step|full.coverage"):
+        _apply(before)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

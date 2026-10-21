@@ -977,7 +977,11 @@ void DistributedCodegen::VisitExpr_(const ir::CallPtr& op) {
   // every emitted orchestrator's signature (see EmitFunction / EmitEntryFunction).
   // The runner fills it with len(DistributedConfig.device_ids) — present for
   // comm-less programs too, so this lowering is uniform.
-  if (ir::IsOp(op, "pld.system.world_size")) {
+  if (ir::IsOp(op, "pld.system.world_size") || ir::IsOp(op, "pld.system.num_workers")) {
+    // HOST's immediate children are its local devices. Keep the established
+    // runner binding; CLUSTER_0 must never reuse it as its node count.
+    CHECK_SPAN(current_func_ && current_func_->level_ == ir::Level::HOST, op->span_)
+        << op->op_->name_ << " requires HOST code generation; CLUSTER_0 lowering is not supported yet";
     current_expr_value_ = "world_size";
     return;
   }

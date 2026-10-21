@@ -2193,5 +2193,50 @@ def test_if_cross_branch_phi_yields_tensors() -> None:
     )
 
 
+@pytest.mark.parametrize("hoisted", [False, True])
+def test_c1b_num_workers_host_dispatch_codegen(hoisted):
+    bound = "n_alias" if hoisted else "pld.num_workers()"
+    hoist = "        n = pld.num_workers()\n        n_alias = n\n" if hoisted else ""
+    program = pl.parse_program(
+        "import pypto.language as pl\n"
+        "import pypto.language.distributed as pld\n"
+        "@pl.program\nclass P:\n"
+        "    @pl.function(type=pl.FunctionType.Orchestration)\n"
+        "    def chip(self, data: pld.DistributedTensor[[64], pl.FP32]):\n"
+        "        return data\n"
+        "    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)\n"
+        "    def host(self):\n"
+        f"{hoist}"
+        "        buf = pld.alloc_window_buffer(pld.num_workers() * 256)\n"
+        "        data = pld.window(buf, [64], dtype=pl.FP32)\n"
+        f"        for r in pl.range({bound}):\n"
+        "            self.chip(data, worker=r)\n"
+        "        return 0\n"
+    )
+    code = _lower(program, convert_to_ssa=True)
+    # HOST keeps the runner's local world_size binding; the new query must be
+    # usable in dispatch loops and the allocation-size expression before them.
+    assert "pld.system.num_workers" not in code, code
+    assert "world_size" in code, code
+    assert re.search(r"workers=\[\*range\(world_size\)\]", code), code
+    assert re.search(r'__comm_d0\[\w+\]\.buffers\["buf(?:__ssa_v\d+)?"\]\.tensor\(', code), code
+    assert re.search(r'_submit_chip\(orch, callables\["chip"\],.*config, \w+\)', code), code
+    compile(code, "<c1b-host-orchestration>", "exec")
+
+
+def test_c1b_cluster_num_workers_codegen_rejects_host_fallback():
+    @pl.program
+    class Prog:
+        @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+        def cluster(self):
+            n = pld.num_workers()
+            return n
+
+    # Parsing the query is supported before executable cluster lowering exists.
+    # Its node count must never silently use HOST's local world_size binding.
+    with pytest.raises(ValueError, match=r"CLUSTER_0.*not supported"):
+        codegen.DistributedCodegen().generate(Prog)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

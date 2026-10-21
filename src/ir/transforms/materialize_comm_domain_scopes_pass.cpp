@@ -215,21 +215,28 @@ class AllocAndWindowCollector : public IRVisitor {
   return chip_orchs.find(gvar->name_) != chip_orchs.end();
 }
 
-/// Unwrap a ``stop_`` expression through one level of SSA assignment indirection
-/// so the dispatch device resolver can see through CSE-hoisted bounds like
-/// ``t__tmp_v0 = pld.system.world_size(); for r in pl.range(t__tmp_v0):``.
-/// Returns ``stop`` unchanged when it is already a literal/call or when the
-/// chain dead-ends in a Var without a known def.
+/// Resolve SSA aliases once per function. Path compression prevents repeated
+/// dispatches sharing long alias chains from rescanning them quadratically.
+/// Definitions are immutable during DispatchAnalyzer's traversal; unknown or
+/// cyclic chains remain unresolved rather than being treated as full coverage.
 [[nodiscard]] ExprPtr UnwrapStopExpr(const ExprPtr& stop,
-                                     const std::unordered_map<const Var*, ExprPtr>& var_defs) {
+                                     const std::unordered_map<const Var*, ExprPtr>& var_defs,
+                                     std::unordered_map<const Var*, ExprPtr>& cache) {
   ExprPtr cur = stop;
+  std::vector<const Var*> path;
   std::unordered_set<const Var*> visited;
   while (auto v = As<Var>(cur)) {
-    if (!visited.insert(v.get()).second) return cur;
+    if (auto hit = cache.find(v.get()); hit != cache.end()) {
+      cur = hit->second;
+      break;
+    }
+    if (!visited.insert(v.get()).second) break;
+    path.push_back(v.get());
     auto it = var_defs.find(v.get());
-    if (it == var_defs.end() || !it->second) return cur;
+    if (it == var_defs.end() || !it->second) break;
     cur = it->second;
   }
+  for (const auto* var : path) cache[var] = cur;
   return cur;
 }
 
@@ -237,8 +244,10 @@ class AllocAndWindowCollector : public IRVisitor {
 /// stack of enclosing ForStmt scopes. Throws pypto::ValueError on unsupported
 /// forms (the user's parser is meant to restrict ``worker=`` to ConstInt or
 /// the induction var of an enclosing pl.range loop).
-DeviceDescriptor ResolveDeviceDescriptor(const ExprPtr& device, const std::vector<ForStmtPtr>& for_stack,
+DeviceDescriptor ResolveDeviceDescriptor(const ExprPtr& device,
+                                         const std::unordered_map<const Var*, ForStmtPtr>& active_loops,
                                          const std::unordered_map<const Var*, ExprPtr>& var_defs,
+                                         std::unordered_map<const Var*, ExprPtr>& bound_cache,
                                          const Span& dispatch_span) {
   DeviceDescriptor desc;
   if (auto ci = As<ConstInt>(device)) {
@@ -248,39 +257,45 @@ DeviceDescriptor ResolveDeviceDescriptor(const ExprPtr& device, const std::vecto
     return desc;
   }
   if (auto v = As<Var>(device)) {
-    for (auto it = for_stack.rbegin(); it != for_stack.rend(); ++it) {
-      const auto& fs = *it;
-      if (fs->loop_var_.get() == v.get()) {
-        // Loop bound determines coverage. Unwrap one level of SSA-assigned temp
-        // so a hoisted ``t = pld.system.world_size()`` is recognised the same
-        // as the direct ``pl.range(pld.system.world_size())`` form.
-        ExprPtr stop = UnwrapStopExpr(fs->stop_, var_defs);
-        if (auto stop_call = As<Call>(stop)) {
-          if (stop_call->op_ && IsOp(stop_call, "pld.system.world_size")) {
-            desc.is_all = true;
-            return desc;
-          }
-        }
-        if (auto stop_ci = As<ConstInt>(stop)) {
-          auto start_ci = As<ConstInt>(UnwrapStopExpr(fs->start_, var_defs));
-          INTERNAL_CHECK_SPAN(start_ci, dispatch_span)
-              << "MaterializeCommDomainScopes: worker=r loop start must unwrap to ConstInt";
-          int64_t start = start_ci->value_;
-          auto step_ci = As<ConstInt>(UnwrapStopExpr(fs->step_, var_defs));
-          INTERNAL_CHECK_SPAN(step_ci, dispatch_span)
-              << "MaterializeCommDomainScopes: worker=r loop step must unwrap to ConstInt";
-          int64_t step = step_ci->value_;
-          INTERNAL_CHECK_SPAN(step == 1, dispatch_span)
-              << "MaterializeCommDomainScopes: worker=r over a non-unit-step loop is not supported (step="
-              << step << ")";
-          INTERNAL_CHECK_SPAN(start >= 0 && stop_ci->value_ >= start, dispatch_span)
-              << "MaterializeCommDomainScopes: worker=r loop range must be [0, N) with N>=0";
-          for (int64_t i = start; i < stop_ci->value_; ++i) desc.subset.insert(i);
+    auto loop = active_loops.find(v.get());
+    if (loop != active_loops.end()) {
+      const auto& fs = loop->second;
+      ExprPtr stop = UnwrapStopExpr(fs->stop_, var_defs, bound_cache);
+      if (auto stop_call = As<Call>(stop)) {
+        if (IsOp(stop_call, "pld.system.world_size") || IsOp(stop_call, "pld.system.num_workers")) {
+          // A dynamic child-count stop covers all children only for [0, N)
+          // with unit step. In particular, an unproven start/step cannot be
+          // accepted merely because the stop is a topology query.
+          auto start = As<ConstInt>(UnwrapStopExpr(fs->start_, var_defs, bound_cache));
+          auto step = As<ConstInt>(UnwrapStopExpr(fs->step_, var_defs, bound_cache));
+          CHECK_SPAN(start && start->value_ == 0, dispatch_span)
+              << "MaterializeCommDomainScopes: dynamic full coverage requires loop start=0";
+          CHECK_SPAN(step && step->value_ == 1, dispatch_span)
+              << "MaterializeCommDomainScopes: dynamic full coverage requires loop step=1";
+          desc.is_all = true;
           return desc;
         }
-        throw pypto::ValueError(
-            "MaterializeCommDomainScopes: worker=r loop bound must be ConstInt or pld.system.world_size()");
       }
+      if (auto stop_ci = As<ConstInt>(stop)) {
+        auto start_ci = As<ConstInt>(UnwrapStopExpr(fs->start_, var_defs, bound_cache));
+        INTERNAL_CHECK_SPAN(start_ci, dispatch_span)
+            << "MaterializeCommDomainScopes: worker=r loop start must unwrap to ConstInt";
+        int64_t start = start_ci->value_;
+        auto step_ci = As<ConstInt>(UnwrapStopExpr(fs->step_, var_defs, bound_cache));
+        INTERNAL_CHECK_SPAN(step_ci, dispatch_span)
+            << "MaterializeCommDomainScopes: worker=r loop step must unwrap to ConstInt";
+        int64_t step = step_ci->value_;
+        INTERNAL_CHECK_SPAN(step == 1, dispatch_span)
+            << "MaterializeCommDomainScopes: worker=r over a non-unit-step loop is not supported (step="
+            << step << ")";
+        INTERNAL_CHECK_SPAN(start >= 0 && stop_ci->value_ >= start, dispatch_span)
+            << "MaterializeCommDomainScopes: worker=r loop range must be [0, N) with N>=0";
+        for (int64_t i = start; i < stop_ci->value_; ++i) desc.subset.insert(i);
+        return desc;
+      }
+      throw pypto::ValueError(
+          "MaterializeCommDomainScopes: worker=r loop bound must be ConstInt, pld.system.world_size() "
+          "or pld.system.num_workers()");
     }
     throw pypto::ValueError(
         "MaterializeCommDomainScopes: worker= Var is not the induction variable of any enclosing pl.range "
@@ -304,15 +319,23 @@ class DispatchAnalyzer : public IRVisitor {
       : view_to_window_(view_to_window), chip_orchs_(chip_orchs), var_defs_(var_defs) {}
 
   void VisitStmt_(const ForStmtPtr& op) override {
-    for_stack_.push_back(op);
+    // Index active induction variables so deeply nested dispatches do not scan
+    // the entire enclosing loop stack at every call. Restore shadowed entries.
+    auto previous = active_loops_.find(op->loop_var_.get());
+    ForStmtPtr saved = previous == active_loops_.end() ? nullptr : previous->second;
+    active_loops_[op->loop_var_.get()] = op;
     ++repeating_scope_depth_;
     IRVisitor::VisitStmt_(op);
     --repeating_scope_depth_;
-    for_stack_.pop_back();
+    if (saved) {
+      active_loops_[op->loop_var_.get()] = std::move(saved);
+    } else {
+      active_loops_.erase(op->loop_var_.get());
+    }
   }
 
   // WhileStmt carries no device-descriptor role (unlike ForStmt, which
-  // for_stack_ tracks for ResolveDeviceDescriptor), but it must still count
+  // active_loops_ tracks for ResolveDeviceDescriptor), but it must still count
   // toward repeating_scope_depth_ so the all_to_all_v loop-use guard in
   // AnalyzeCollective rejects a call nested in a while loop too.
   void VisitStmt_(const WhileStmtPtr& op) override {
@@ -332,7 +355,8 @@ class DispatchAnalyzer : public IRVisitor {
       }
     }
     if (!device) return;
-    DeviceDescriptor desc = ResolveDeviceDescriptor(device, for_stack_, var_defs_, op->span_);
+    DeviceDescriptor desc =
+        ResolveDeviceDescriptor(device, active_loops_, var_defs_, bound_cache_, op->span_);
     for (const auto& arg : op->args_) {
       auto arg_var = AsVarLike(arg);
       if (!arg_var) continue;
@@ -520,7 +544,8 @@ class DispatchAnalyzer : public IRVisitor {
   const std::unordered_map<const Var*, WindowRecord>& view_to_window_;
   const std::map<std::string, FunctionPtr>& chip_orchs_;
   const std::unordered_map<const Var*, ExprPtr>& var_defs_;
-  std::vector<ForStmtPtr> for_stack_;
+  std::unordered_map<const Var*, ForStmtPtr> active_loops_;
+  std::unordered_map<const Var*, ExprPtr> bound_cache_;
   int repeating_scope_depth_ = 0;
 };
 

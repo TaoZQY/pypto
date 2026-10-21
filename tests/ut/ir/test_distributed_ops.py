@@ -27,7 +27,7 @@ from typing import Any, cast
 
 import pypto
 import pytest
-from pypto import DataType, ir
+from pypto import DataType, ir, passes
 from pypto.ir.op.distributed import system_ops as dist_system_ops
 from pypto.ir.op.distributed import tensor_ops as dist_tensor_ops
 from pypto.ir.op.distributed import tile_ops as dist_tile_ops
@@ -2767,6 +2767,204 @@ def test_all_to_all_v_rejects_partial_valid_shape_target():
     args[1] = ir.Var("target", ir.DistributedTensorType(shape_exprs, DataType.FP32, None, view), span)
     with pytest.raises(ValueError, match="full, packed view"):
         ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
+
+
+def test_c1b_num_workers_registration_and_ir_builder():
+    span = ir.Span.unknown()
+    call = ir.create_op_call("pld.system.num_workers", [], {}, span)
+    assert isinstance(call.type, ir.ScalarType)
+    assert call.type.dtype == DataType.INT64
+    assert ir.get_op_argument_count("pld.system.num_workers") == 0
+    assert call.args == []
+    assert call.kwargs == {}
+    ir.assert_structural_equal(call, dist_system_ops.num_workers(span=span))
+    ir.assert_structural_equal(call, ir.deserialize(ir.serialize(call)))
+
+
+@pytest.mark.parametrize("invalid", ["positional", "keyword"])
+def test_c1b_num_workers_ir_rejects_arguments(invalid):
+    span = ir.Span.unknown()
+    args = [ir.ConstInt(1, DataType.INT64, span)] if invalid == "positional" else []
+    kwargs = {"count": 1} if invalid == "keyword" else {}
+    with pytest.raises(ValueError, match="positional|kwargs|keyword"):
+        ir.create_op_call("pld.system.num_workers", args, kwargs, span)
+
+
+def _c1b_legality_program(call, *, level, role=ir.Role.Orchestrator, scope=None):
+    """Construct IR without the parser, using a distinct Op with the canonical name."""
+    span = ir.Span.unknown()
+    cloned = ir.Call(ir.Op(call.op.name), call.args, call.kwargs, call.attrs, call.type, span)
+    body = ir.EvalStmt(cloned, span)
+    if scope == "incore":
+        body = ir.InCoreScopeStmt(body=body, span=span)
+    elif scope == "spmd":
+        body = ir.SpmdScopeStmt(core_num=2, body=body, span=span)
+    elif scope == "runtime":
+        body = ir.RuntimeScopeStmt(body=body, span=span)
+    elif scope is not None:
+        body = ir.HierarchyScopeStmt(scope, ir.Role.Orchestrator, body=body, span=span)
+    body = ir.SeqStmts([body, ir.ReturnStmt([], span)], span)
+    params = [arg for arg in call.args if isinstance(arg, ir.Var)]
+    func = ir.Function("main", params, [], body, span, level=level, role=role)
+    return ir.Program([func], "P", span)
+
+
+def _c1b_legality_diagnostics(program):
+    properties = passes.IRPropertySet()
+    properties.insert(passes.IRProperty.TypeChecked)
+    return passes.PropertyVerifierRegistry.verify(properties, program)
+
+
+@pytest.mark.parametrize("restored", [False, True])
+@pytest.mark.parametrize("op_name", ["pld.system.num_workers", "pld.system.world_size"])
+@pytest.mark.parametrize(
+    ("level", "scope", "legal"),
+    [
+        (ir.Level.HOST, None, True),
+        (ir.Level.HOST, "runtime", True),
+        (ir.Level.CLUSTER_0, None, None),
+        (ir.Level.CHIP, None, False),
+        (ir.Level.HOST, "incore", False),
+        (ir.Level.HOST, "spmd", False),
+        (ir.Level.CLUSTER_0, ir.Level.HOST, True),
+        (ir.Level.HOST, ir.Level.CLUSTER_0, None),
+        (ir.Level.CLUSTER_0, ir.Level.CHIP, False),
+    ],
+)
+def test_c1b_direct_ir_query_legality(op_name, level, scope, legal, restored):
+    # A cluster's child count is legal; its local world_size query is not.
+    if legal is None:
+        legal = op_name != ir.get_op("pld.system.world_size").name
+    call = ir.create_op_call(op_name, [], {}, ir.Span.unknown())
+    program = _c1b_legality_program(call, level=level, scope=scope)
+    if restored:
+        program = ir.deserialize(ir.serialize(program))
+    errors = _c1b_legality_diagnostics(program)
+    if legal:
+        assert errors == [], [error.message for error in errors]
+    else:
+        assert errors, "Direct/deserialized IR must not bypass query context validation"
+        assert any(op_name in error.message for error in errors)
+
+
+@pytest.mark.parametrize("level", [ir.Level.HOST, ir.Level.CLUSTER_0])
+@pytest.mark.parametrize("restored", [False, True])
+def test_c1b_direct_ir_num_workers_rejects_worker_role(level, restored):
+    call = ir.create_op_call("pld.system.num_workers", [], {}, ir.Span.unknown())
+    program = _c1b_legality_program(call, level=level, role=ir.Role.SubWorker)
+    if restored:
+        program = ir.deserialize(ir.serialize(program))
+    errors = _c1b_legality_diagnostics(program)
+    assert errors, "Only orchestrators have an immediate-child worker count"
+    assert any(call.op.name in error.message for error in errors)
+
+
+def _c1b_communication_call(op_name):
+    span = ir.Span.unknown()
+    signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
+    if op_name == ir.get_op("pld.tensor.barrier").name:
+        return dist_tensor_ops.barrier(signal, span=span)
+    if op_name == ir.get_op("builtin.tensor.barrier").name:
+        base = _ir._create_internal_op_call(op_name, [signal], {}, span)
+        attrs = {"worker": ir.ConstInt(0, DataType.INT64, span), "arg_directions": [ir.ArgDirection.InOut]}
+        return ir.Call(base.op, base.args, base.kwargs, attrs, base.type, span)
+    data = _make_distributed_tensor_var("data", [8, 8], DataType.FP32, span)
+    return dist_tile_ops.remote_load(data, ir.ConstInt(0, DataType.INT32, span), [0, 0], [8, 8], span=span)
+
+
+@pytest.mark.parametrize("restored", [False, True])
+@pytest.mark.parametrize("op_name", ["pld.tensor.barrier", "builtin.tensor.barrier", "pld.tile.remote_load"])
+@pytest.mark.parametrize(
+    ("level", "scope", "legal"),
+    [
+        (ir.Level.CLUSTER_0, None, False),
+        (ir.Level.HOST, ir.Level.CLUSTER_0, False),
+        (ir.Level.CLUSTER_0, ir.Level.HOST, True),
+    ],
+)
+def test_c1b_direct_ir_communication_legality(op_name, level, scope, legal, restored):
+    program = _c1b_legality_program(_c1b_communication_call(op_name), level=level, scope=scope)
+    if restored:
+        program = ir.deserialize(ir.serialize(program))
+    errors = _c1b_legality_diagnostics(program)
+    if legal:
+        assert errors == [], [error.message for error in errors]
+    else:
+        assert errors, "Direct/deserialized IR must reject communication in CLUSTER_0"
+        assert any(op_name in error.message and "CLUSTER_0" in error.message for error in errors)
+
+
+@pytest.mark.parametrize("instrumented", [False, True])
+def test_c1b_lower_composite_rejects_direct_cluster_collective(instrumented):
+    program = _c1b_legality_program(_c1b_communication_call("pld.tensor.barrier"), level=ir.Level.CLUSTER_0)
+    instruments = (
+        [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)] if instrumented else []
+    )
+    # Instrumentation reports the invalid IR before the transform as pypto.Error;
+    # standalone lowering must independently reject it as a user ValueError.
+    error_type = pypto.Error if instrumented else ValueError
+    with passes.PassContext(instruments, verification_level=passes.VerificationLevel.NONE):
+        with pytest.raises(error_type, match="CLUSTER_0"):
+            passes.lower_composite_ops()(program)
+
+
+@pytest.mark.parametrize("op_name", ["pld.system.world_size", "pld.system.num_workers"])
+@pytest.mark.parametrize("restored", [False, True])
+def test_c1b_spmd_ir_launch_count_query_uses_parent_host_context(op_name, restored):
+    span = ir.Span.unknown()
+    query = ir.create_op_call(op_name, [], {}, span)
+    body = ir.SeqStmts([], span)
+    scope = ir.SpmdScopeStmt(core_num=query, body=body, span=span)
+    func = ir.Function("main", [], [], scope, span, level=ir.Level.HOST, role=ir.Role.Orchestrator)
+    program = ir.Program([func], "P", span)
+    if restored:
+        program = ir.deserialize(ir.serialize(program))
+    errors = _c1b_legality_diagnostics(program)
+    assert errors == [], [error.message for error in errors]
+
+
+@pytest.mark.parametrize("op_name", ["pld.system.world_size", "pld.system.num_workers"])
+@pytest.mark.parametrize("restored", [False, True])
+@pytest.mark.parametrize(
+    ("kind", "outer", "inner", "legal"),
+    [
+        (ir.ScopeKind.Hierarchy, ir.Level.HOST, ir.Level.CLUSTER_0, True),
+        (ir.ScopeKind.Hierarchy, ir.Level.CLUSTER_0, ir.Level.HOST, None),
+        (ir.ScopeKind.InCore, ir.Level.HOST, None, True),
+        (ir.ScopeKind.Spmd, ir.Level.HOST, None, True),
+    ],
+)
+def test_c1b_scope_header_attrs_use_parent_context(op_name, restored, kind, outer, inner, legal):
+    span = ir.Span.unknown()
+    query = ir.create_op_call(op_name, [], {}, span)
+    predicate = ir.Gt(query, ir.ConstInt(0, DataType.INT64, span), DataType.BOOL, span)
+    # pypto.ir.IRBuilder is the context-manager wrapper; this fixture exercises
+    # the native begin/end API and needs the directly imported native module.
+    builder = _ir.IRBuilder()
+    builder.begin_function("main", span, level=outer, role=ir.Role.Orchestrator)
+    scope_options = {}
+    if kind == ir.ScopeKind.Hierarchy:
+        scope_options = {"level": inner, "role": ir.Role.Orchestrator}
+    elif kind == ir.ScopeKind.InCore:
+        scope_options = {"split": ir.SplitMode.NONE}
+    elif kind == ir.ScopeKind.Spmd:
+        scope_options = {"core_num": ir.ConstInt(2, DataType.INT64, span)}
+    builder.begin_scope(kind, span, attrs=[("predicate", predicate)], **scope_options)
+    builder.emit(ir.EvalStmt(ir.ConstInt(0, DataType.INT64, span), span))
+    builder.end_scope(span)
+    builder.emit(ir.ReturnStmt([], span))
+    program = ir.Program([builder.end_function(span)], "P", span)
+    if restored:
+        program = ir.deserialize(ir.serialize(program))
+    errors = _c1b_legality_diagnostics(program)
+    if legal is None:
+        legal = op_name != ir.get_op("pld.system.world_size").name
+    if legal:
+        assert errors == [], [error.message for error in errors]
+    else:
+        # A HOST body cannot legalize a header evaluated by the outer cluster.
+        assert errors, "Scope operands must be checked before entering the body context"
+        assert any(op_name in error.message for error in errors)
 
 
 if __name__ == "__main__":
