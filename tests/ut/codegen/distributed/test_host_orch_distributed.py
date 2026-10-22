@@ -32,11 +32,14 @@ Plus regressions:
   ``allocate_domain`` wrapper.
 """
 
+import ast
 import os
 import re
 import shutil
 import subprocess
+from contextlib import nullcontext
 from importlib import resources
+from types import SimpleNamespace
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -2307,18 +2310,445 @@ def test_c1b_num_workers_host_dispatch_codegen(hoisted):
     compile(code, "<c1b-host-orchestration>", "exec")
 
 
-def test_c1b_cluster_num_workers_codegen_rejects_host_fallback():
+class _C3aTaskArgs:
+    """Record the generated wire layout, enforcing Simpler's tensor-first ABI."""
+
+    def __init__(self):
+        self.tensors = []
+        self.scalars = []
+        self.deps = []
+
+    def add_tensor(self, tensor, tag):
+        assert not self.scalars, "Generated code added a tensor after a scalar"
+        self.tensors.append((tensor, tag))
+
+    def add_scalar(self, value):
+        self.scalars.append(value)
+
+    def add_dep_wait(self, handle):
+        self.deps.append(handle)
+
+
+def _c3a_execute(code, tensors, *, nodes=(7, 13), node_sizes=(3, 3), retain=False, provider=False, repeats=1):
+    """Execute the actual generated body without importing a device runtime.
+
+    Only imports are removed. All function bodies, markers and dispatch logic
+    come from native codegen; the real late passes ran before this helper.
+    """
+    module = ast.parse(code)
+    module.body = [node for node in module.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
+    calls, routes, domains = [], [], []
+    bindings = [object() for _ in nodes]
+    config = object()
+
+    def io_arg(binding, tensor, tag):
+        routed = (binding, tensor, tag)
+        routes.append(routed)
+        return routed
+
+    def submit(handle, args, cfg, *, worker):
+        assert cfg is config
+        task = object()
+        calls.append(SimpleNamespace(handle=handle, args=args, worker=worker, task=task))
+        return task
+
+    def allocate(**kwargs):
+        domains.append(kwargs)
+        return nullcontext(SimpleNamespace(domain_id=907))
+
+    tags = SimpleNamespace(INPUT="input", OUTPUT="output", OUTPUT_EXISTING="existing", INOUT="inout")
+    namespace = {
+        "TaskArgs": _C3aTaskArgs,
+        "TensorArgType": tags,
+        "CommBufferSpec": SimpleNamespace,
+        "_io_arg": io_arg,
+    }
+    exec(compile(module, "<c3a-generated-cluster>", "exec"), namespace)
+    entries = [value for value in namespace.values() if getattr(value, "_pypto_distributed_entry", False)]
+    assert len(entries) == 1
+    orch = SimpleNamespace(submit_next_level=submit, allocate_global_domain=allocate)
+    # A supplied provider must be used instead of the ordinary allocator.
+    if provider:
+        orch.allocate_global_domain = None
+    kwargs = {"_domain_provider": allocate} if provider else {}
+    keep = []
+    for _ in range(repeats):
+        entries[0](
+            orch,
+            None,
+            config,
+            tensors=tensors,
+            callables={"node": [101 + 2 * i for i in range(len(nodes))]},
+            nodes=list(nodes),
+            node_sizes=list(node_sizes),
+            node_bindings=bindings,
+            _keep=keep,
+            _retain=retain,
+            **kwargs,
+        )
+    assert keep == [call.args for call in calls]
+    return SimpleNamespace(calls=calls, routes=routes, domains=domains, bindings=bindings)
+
+
+@pytest.mark.parametrize("hoisted", [False, True], ids=["direct", "hoisted"])
+def test_c3a_cluster_num_workers_counts_nodes(hoisted):
+    hoist = "        n = pld.num_workers()\n        alias = n\n" if hoisted else ""
+    bound = "alias" if hoisted else "pld.num_workers()"
+    program = pl.parse_program(
+        "@pl.program\nclass P:\n"
+        "    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)\n"
+        "    def node(self):\n        return 0\n"
+        "    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)\n"
+        "    def cluster(self):\n"
+        f"{hoist}        for w in pl.range({bound}):\n"
+        "            self.node(worker=w)\n        return 0\n"
+    )
+    code = _lower(program, convert_to_ssa=True)
+    signature = next(line for line in code.splitlines() if line.startswith("def cluster("))
+    assert "world_size" not in signature, code
+    assert "num_workers = len(nodes)" in code, code
+    assert "pld.system.num_workers" not in code, code
+    result = _c3a_execute(code, {})
+    assert [(call.handle, call.worker) for call in result.calls] == [(101, 7), (103, 13)]
+
+
+@pytest.mark.parametrize("selector", ["constant", "loop"])
+def test_c3a_cluster_routes_ordinary_arguments_and_preserves_scalar_order(selector):
+    launch = (
+        "        out, state = self.node(x, count, out, scale, state, worker=1)\n"
+        if selector == "constant"
+        else "        for w in pl.range(pld.num_workers()):\n"
+        "            out, state = self.node(x, count, out, scale, state, worker=w)\n"
+    )
+    program = pl.parse_program(f"""
+@pl.program
+class P:
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def node(
+        self, x: pl.Tensor[[8], pl.FP32], count: pl.Scalar[pl.INT32],
+        out: pl.Out[pl.Tensor[[8], pl.FP32]], scale: pl.Scalar[pl.FP32],
+        state: pl.InOut[pl.Tensor[[8], pl.FP32]],
+    ) -> tuple[pl.Tensor[[8], pl.FP32], pl.Tensor[[8], pl.FP32]]:
+        return out, state
+    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+    def cluster(
+        self, x: pl.Tensor[[8], pl.FP32], count: pl.Scalar[pl.INT32],
+        out: pl.Out[pl.Tensor[[8], pl.FP32]], scale: pl.Scalar[pl.FP32],
+        state: pl.InOut[pl.Tensor[[8], pl.FP32]],
+    ):
+{launch}        return out
+""")
+    code = _lower(program, convert_to_ssa=True)
+    assert "add_chip_tensor_arg" not in code, code
+    assert "_submit_chip" not in code, code
+    assert "make_tensor_arg" not in code, code
+    x, out, state = object(), object(), object()
+    result = _c3a_execute(
+        code,
+        {
+            "x__ssa_v0": x,
+            "count__ssa_v0": -3,
+            "out__ssa_v0": out,
+            "scale__ssa_v0": 1.25,
+            "state__ssa_v0": state,
+        },
+    )
+    ranks = [1] if selector == "constant" else [0, 1]
+    assert [(call.handle, call.worker) for call in result.calls] == [
+        (101 + 2 * rank, (7, 13)[rank]) for rank in ranks
+    ]
+    for call, rank in zip(result.calls, ranks):
+        assert call.args.scalars == [-3, 1.25]
+        assert call.args.tensors == [
+            ((result.bindings[rank], tensor, tag), tag)
+            for tensor, tag in [(x, "input"), (out, "existing"), (state, "inout")]
+        ]
+    assert result.routes == [tensor for call in result.calls for tensor, _ in call.args.tensors]
+
+
+@pytest.mark.parametrize("subset", [False, True], ids=["full", "subset"])
+@pytest.mark.parametrize("provider", [False, True], ids=["allocator", "provider"])
+def test_c3a_global_domain_omits_window_wire_tensors_and_preserves_alignment(subset, provider):
+    launch = (
+        "        out = self.node(out, count, tiny, wide, worker=0)\n"
+        "        out = self.node(out, count, tiny, wide, worker=2)\n"
+        if subset
+        else "        for w in pl.range(pld.num_workers()):\n"
+        "            out = self.node(out, count, tiny, wide, worker=w)\n"
+    )
+    program = pl.parse_program(f"""
+@pl.program
+class P:
+    @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+    def chip(self, tiny: pld.DistributedTensor[[3], pl.UINT8], wide: pld.DistributedTensor[[129], pl.UINT8]):
+        return tiny
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def node(
+        self, out: pl.Out[pl.Tensor[[3], pl.UINT8]], count: pl.Scalar[pl.INT32],
+        tiny: pld.DistributedTensor[[3], pl.UINT8], wide: pld.DistributedTensor[[129], pl.UINT8],
+    ) -> pl.Tensor[[3], pl.UINT8]:
+        self.chip(tiny, wide, worker=0)
+        return out
+    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+    def cluster(self, out: pl.Out[pl.Tensor[[3], pl.UINT8]], count: pl.Scalar[pl.INT32]):
+        tiny_buf = pld.alloc_window_buffer(3)
+        wide_buf = pld.alloc_window_buffer(129)
+        tiny = pld.window(tiny_buf, [3], dtype=pl.UINT8)
+        wide = pld.window(wide_buf, [129], dtype=pl.UINT8)
+{launch}        return out
+""")
+    code = _lower(program, convert_to_ssa=True)
+    assert "members=" in code and "workers=" not in code, code
+    assert ".domain_id" in code and ".device_ctx" not in code, code
+    assert ".buffers[" not in code, code
+    assert "_ord" not in code, code
+    assert not re.search(r'tensors\["(?:tiny|wide)(?:__ssa_v\d+)?"\]', code), code
+    out = object()
+    result = _c3a_execute(
+        code,
+        {"out__ssa_v0": out, "count__ssa_v0": -5},
+        nodes=(7, 13, 21),
+        node_sizes=(2, 2, 2),
+        retain=True,
+        provider=provider,
+    )
+    ranks = [0, 2] if subset else [0, 1, 2]
+    assert len(result.domains) == 1
+    domain = result.domains[0]
+    assert domain["members"] == [((7, 13, 21)[rank], device) for rank in ranks for device in range(2)]
+    assert domain["retain_after_run"] is True
+    # Preserve the current 64-byte physical slot alignment, without exposing
+    # padding as the logical buffer count.
+    assert domain["window_size"] == 256
+    assert [(buffer.count, buffer.nbytes) for buffer in domain["buffers"]] == [(3, 64), (129, 192)]
+    assert [(call.handle, call.worker) for call in result.calls] == [
+        (101 + 2 * rank, (7, 13, 21)[rank]) for rank in ranks
+    ]
+    for call in result.calls:
+        assert len(call.args.tensors) == 1
+        assert call.args.tensors[0][1] == "existing"
+        assert call.args.scalars == [-5, 907, 907]
+
+
+def test_c3a_cluster_submit_preserves_explicit_dependencies_and_output_aliases():
     @pl.program
     class Prog:
-        @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
-        def cluster(self):
-            n = pld.num_workers()
-            return n
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def node(self, out: pl.Out[pl.Tensor[[8], pl.FP32]]) -> pl.Tensor[[8], pl.FP32]:
+            return out
 
-    # Parsing the query is supported before executable cluster lowering exists.
-    # Its node count must never silently use HOST's local world_size binding.
-    with pytest.raises(ValueError, match=r"CLUSTER_0.*not supported"):
-        codegen.DistributedCodegen().generate(Prog)
+        @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+        def cluster(self, out: pl.Out[pl.Tensor[[8], pl.FP32]]):
+            produced, producer = pl.submit(self.node, out, worker=0)
+            consumed, consumer = pl.submit(self.node, produced, worker=1, deps=[producer])
+            return consumed
+
+    code = _lower(Prog)
+    assert "_ta_0_handle = orch.submit_next_level(" in code, code
+    assert "_ta_1.add_dep_wait(producer)" in code, code
+    out = object()
+    tensors = {"out": out}
+    result = _c3a_execute(code, tensors)
+    assert len(result.calls) == 2
+    assert result.calls[0].args.deps == []
+    assert result.calls[1].args.deps == [result.calls[0].task]
+    assert tensors["produced"] is out and tensors["consumed"] is out
+    assert [(call.handle, call.worker) for call in result.calls] == [(101, 7), (103, 13)]
+
+
+def test_c3a_cluster_routes_implicit_return_target_before_scalars():
+    @pl.program
+    class Prog:
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def node(self, x: pl.Tensor[[8], pl.FP32], count: pl.Scalar[pl.INT32]) -> pl.Tensor[[8], pl.FP32]:
+            return x
+
+        @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+        def cluster(self, x: pl.Tensor[[8], pl.FP32], count: pl.Scalar[pl.INT32]):
+            returned = self.node(x, count, worker=1)
+            return returned
+
+    code = _lower(Prog, convert_to_ssa=True)
+    assert "make_tensor_arg" not in code and "add_chip_tensor_arg" not in code, code
+    x, returned = object(), object()
+    # Preseed the generated return storage to isolate node argument packing
+    # from Torch allocation. Embedded HOST return binding belongs to C3b.
+    result = _c3a_execute(code, {"x__ssa_v0": x, "count__ssa_v0": 9, "returned__ssa_v0": returned})
+    assert len(result.calls) == 1
+    call = result.calls[0]
+    assert (call.handle, call.worker) == (103, 13)
+    assert call.args.tensors == [
+        ((result.bindings[1], x, "input"), "input"),
+        ((result.bindings[1], returned, "existing"), "existing"),
+    ]
+    assert call.args.scalars == [9]
+    assert result.routes == [tensor for tensor, _ in call.args.tensors]
+
+
+def test_c3a_cluster_same_level_subworker_is_rejected():
+    @pl.program
+    class Prog:
+        @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.SubWorker)
+        def helper(x: pl.Tensor[[8], pl.FP32]):
+            pass
+
+        @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+        def cluster(self, x: pl.Tensor[[8], pl.FP32]):
+            self.helper(x)
+            return x
+
+    # CLUSTER's node ABI has no local sub_ids/CHIP conversion contract. Until
+    # that feature exists, fail at generation instead of emitting a NameError.
+    with pytest.raises(ValueError, match=r"CLUSTER_0.*SubWorker.*not supported"):
+        _lower(Prog, convert_to_ssa=True)
+
+
+@pytest.mark.parametrize(
+    ("trips", "post_loop", "expected"),
+    [(2, False, [5, 6]), (0, True, [5]), (2, True, [5, 6, 7])],
+    ids=["body-updates", "zero-trip-result", "final-result"],
+)
+def test_c3a_cluster_scalar_loop_carries_updated_values(trips, post_loop, expected):
+    bound = "pld.num_workers()" if trips else "0"
+    final_dispatch = "        self.node(count, worker=0)\n" if post_loop else ""
+    program = pl.parse_program(f"""
+@pl.program
+class P:
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def node(self, count: pl.Scalar[pl.INT32]):
+        return 0
+    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+    def cluster(self, seed: pl.Scalar[pl.INT32]):
+        count = seed
+        for w in pl.range({bound}):
+            self.node(count, worker=w)
+            count = count + pl.const(1, pl.INT32)
+{final_dispatch}        return 0
+""")
+    code = _lower(program, convert_to_ssa=True)
+    result = _c3a_execute(code, {"seed__ssa_v0": 5})
+    # Same-storage tensor aliases cannot expose a missing SSA carry update.
+    # This scalar changes every iteration, and the zero-trip case must retain
+    # its initial value for the dispatch after the loop.
+    assert [call.args.scalars for call in result.calls] == [[value] for value in expected]
+    assert all(not call.args.tensors for call in result.calls)
+
+
+@pytest.mark.parametrize("alias", [False, True], ids=["direct-query", "query-alias"])
+def test_c3a_cluster_allocation_helper_binds_node_count(alias):
+    binding = "        n = pld.num_workers()\n" if alias else ""
+    shape = "n" if alias else "pld.num_workers()"
+    program = pl.parse_program(
+        "@pl.program\nclass P:\n"
+        "    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)\n"
+        "    def cluster(self):\n"
+        f"{binding}        scratch = pl.create_tensor([{shape}], dtype=pl.FP32)\n"
+        "        return 0\n"
+    )
+    code = _lower(program, convert_to_ssa=True)
+    allocations = []
+    float32 = object()
+
+    def zeros(sizes, *, dtype):
+        allocations.append((sizes, dtype))
+        tensor = SimpleNamespace()
+        tensor.share_memory_ = lambda: tensor
+        return tensor
+
+    module = ast.parse(code)
+    module.body = [node for node in module.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
+    namespace = {"torch": SimpleNamespace(zeros=zeros, float32=float32)}
+    exec(compile(module, "<c3a-generated-allocations>", "exec"), namespace)
+    tensors = {}
+    # This is the parent CLUSTER helper, before any entry invocation. Topology
+    # must bind its shape independently of the entry's local num_workers value.
+    namespace["_alloc_intermediates"](tensors, nodes=[7, 13, 21])
+    assert allocations == [((3,), float32)]
+    assert len(tensors) == 1
+    helper = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_alloc_intermediates"
+    )
+    assert [arg.arg for arg in helper.args.args] == ["tensors"]
+    assert [arg.arg for arg in helper.args.kwonlyargs] == ["nodes"]
+
+
+@pytest.mark.parametrize("submit", [False, True], ids=["call", "submit"])
+def test_c3a_cluster_implicit_dispatch_selects_nodes_and_resets_per_invocation(submit):
+    launch = (
+        "        out, first = pl.submit(self.node, x, count, out)\n"
+        "        out, second = pl.submit(self.node, x, count, out, deps=[first])\n"
+        if submit
+        else "        out = self.node(x, count, out)\n        out = self.node(x, count, out)\n"
+    )
+    program = pl.parse_program(f"""
+@pl.program
+class P:
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def node(
+        self, x: pl.Tensor[[8], pl.FP32], count: pl.Scalar[pl.INT32],
+        out: pl.Out[pl.Tensor[[8], pl.FP32]],
+    ) -> pl.Tensor[[8], pl.FP32]:
+        return out
+    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+    def cluster(
+        self, x: pl.Tensor[[8], pl.FP32], count: pl.Scalar[pl.INT32],
+        out: pl.Out[pl.Tensor[[8], pl.FP32]],
+    ):
+{launch}        return out
+""")
+    code = _lower(program, convert_to_ssa=True)
+    x, out = object(), object()
+    result = _c3a_execute(
+        code,
+        {"x__ssa_v0": x, "count__ssa_v0": -7, "out__ssa_v0": out},
+        nodes=(7, 13, 21),
+        node_sizes=(2, 4, 6),
+        repeats=2,
+    )
+    # Reuse the same compiled module and orchestration object. Placement must
+    # restart for each entry invocation, independently of local device counts.
+    assert [(call.handle, call.worker) for call in result.calls] == [(101, 7), (103, 13)] * 2
+    for i, call in enumerate(result.calls):
+        rank = i % 2
+        assert call.args.tensors == [
+            ((result.bindings[rank], x, "input"), "input"),
+            ((result.bindings[rank], out, "existing"), "existing"),
+        ]
+        assert call.args.scalars == [-7]
+        expected_deps = [result.calls[i - 1].task] if submit and rank == 1 else []
+        assert call.args.deps == expected_deps
+
+
+def test_c3a_cluster_metadata_only_loop_emits_valid_python():
+    program = pl.parse_program("""
+@pl.program
+class P:
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def node(self, data: pld.DistributedTensor[[8], pl.FP32]):
+        return data
+    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+    def cluster(self):
+        buffer = pld.alloc_window_buffer(32)
+        data = pld.window(buffer, [8], dtype=pl.FP32)
+        alias = data
+        for w in pl.range(2):
+            alias = data
+        self.node(alias, worker=0)
+        return 0
+""")
+    code = _lower(program, convert_to_ssa=True)
+    # Native window metadata survives the loop, but none of its aliases has a
+    # Python tensor slot. Suppressing those statements must leave a valid suite.
+    assert ".add_tensor(" not in code and ".buffers[" not in code, code
+    assert not re.search(r'tensors\["(?:data|alias)(?:__(?:ssa|iter|rv)_v\d+)?"\]', code), code
+    result = _c3a_execute(code, {})
+    assert len(result.domains) == len(result.calls) == 1
+    call = result.calls[0]
+    assert (call.handle, call.worker) == (101, 7)
+    assert call.args.tensors == []
+    assert call.args.scalars == [907]
 
 
 if __name__ == "__main__":

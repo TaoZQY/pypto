@@ -25,6 +25,8 @@ namespace hierarchy {
 /// Inputs to a complete ordinary host-tensor append statement. The generator
 /// owns argument grouping and supplies the tensor-pool ordinal, not the IR
 /// parameter index (scalar parameters do not occupy tensor-pool entries).
+/// worker_expr is the local Worker expression for HOST and the logical child
+/// node index for CLUSTER_0; the latter selects the node's routing binding.
 struct HostArgSpec {
   std::string task_args;
   std::string tensor_expr;
@@ -53,7 +55,7 @@ class LevelHandler {
   [[nodiscard]] virtual std::vector<std::string> GetImports() const = 0;
 };
 
-/// Return the process-lifetime HOST policy, or nullptr for an unsupported level.
+/// Return the process-lifetime HOST/CLUSTER_0 policy, or nullptr for an unsupported level.
 /// Accepts ir::Level enum values, not Linqu level numbers. Having a handler does
 /// not establish collective legality or enable dispatch at another level.
 [[nodiscard]] const LevelHandler* GetLevelHandler(ir::Level level);

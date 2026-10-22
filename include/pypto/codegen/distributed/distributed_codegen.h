@@ -140,6 +140,7 @@ class DistributedCodegen : public CodegenBase {
   void VisitExpr_(const ir::CallPtr& op) override;
   void VisitExpr_(const ir::SubmitPtr& op) override;
   void VisitExpr_(const ir::VarPtr& op) override;
+  void VisitExpr_(const ir::IterArgPtr& op) override;
   void VisitExpr_(const ir::ConstIntPtr& op) override;
   void VisitExpr_(const ir::ConstFloatPtr& op) override;
   void VisitExpr_(const ir::ConstBoolPtr& op) override;
@@ -184,7 +185,7 @@ class DistributedCodegen : public CodegenBase {
 
  private:
   // Code structure emission
-  void EmitImports();
+  void EmitImports(const ir::FunctionPtr& entry);
   void EmitFunction(const ir::FunctionPtr& func);
   void EmitEntryFunction();
   // Tag the emitted orchestrator/entry with a sentinel attribute so the runtime
