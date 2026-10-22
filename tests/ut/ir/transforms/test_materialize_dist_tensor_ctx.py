@@ -933,5 +933,719 @@ def test_return_call_reuses_returned_param_ctx():
     ir.assert_structural_equal(_derive_and_materialize(Before), Expected)
 
 
+@pytest.mark.parametrize("kind", ["call", "submit"])
+def test_c2b_supplied_distributed_out_return_uses_output_ctx(kind):
+    """Supplied Out has caller provenance distinct from the input's context."""
+    span = _span()
+    memref = ir.MemRef("output_storage", 0, 16, span)
+    dt = ir.DistributedTensorType([4], pl.FP32, memref, ir.TensorView(stride=[1], layout=ir.TensorLayout.ND))
+    source, output = ir.Var("source", _dist_ty(), span), ir.Var("output", dt, span)
+    stage = ir.Function(
+        "stage",
+        [(source, ir.ParamDirection.In), (output, ir.ParamDirection.Out)],
+        [source.type, dt],
+        ir.ReturnStmt([source, output], span),
+        span,
+        type=ir.FunctionType.InCore,
+    )
+    invocation = _c2b_invocation(kind, [source, output], [source.type, dt], span)
+    attrs = {
+        **invocation.attrs,
+        "arg_directions": [
+            ir.ArgDirection.Input,
+            ir.ArgDirection.OutputExisting,
+        ],
+    }
+    if kind == "call":
+        invocation = ir.Call(invocation.op, invocation.args, invocation.kwargs, attrs, invocation.type, span)
+    else:
+        invocation = ir.Submit(
+            invocation.op,
+            invocation.args,
+            [],
+            invocation.kwargs,
+            attrs,
+            invocation.type,
+            span,
+            core_num=invocation.core_num,
+            sync_start=True,
+            allow_early_resolve=True,
+            predicate=invocation.predicate,
+        )
+    packed = ir.Var("packed", invocation.type, span)
+    result = ir.Var("result", dt, span)
+    ctx = ir.Var("ctx", ir.CommCtxType(), span)
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(packed, invocation, span),
+            ir.AssignStmt(result, ir.TupleGetItemExpr(packed, 1, span), span),
+            ir.AssignStmt(ctx, ir.create_op_call("pld.system.get_comm_ctx", [result], {}, span), span),
+            ir.ReturnStmt([], span),
+        ],
+        span,
+    )
+    if kind == "submit":
+        body = ir.RuntimeScopeStmt(manual=True, body=body, span=span)
+    caller = ir.Function(
+        "caller",
+        [source, output],
+        [],
+        body,
+        span,
+        type=ir.FunctionType.Orchestration,
+    )
+    after = passes.materialize_dist_tensor_ctx()(ir.Program([stage, caller], "SuppliedDTOut", span))
+    caller, stage = _get_func(after, "caller"), _get_func(after, "stage")
+    body = caller.body.body if kind == "submit" else caller.body
+    launch = body.stmts[0].value
+    assert list(launch.args[-2:]) == list(caller.params[-2:])
+    assert body.stmts[2].value is caller.params[-1]
+    assert body.stmts[2].value is not caller.params[-2]
+    assert stage.params[1].type.memref is memref
+    ir.assert_structural_equal(stage.params[1].type, dt)
+    assert body.stmts[1].var.type is dt
+    assert body.stmts[1].value.type is dt
+
+
+def _c2b_invocation(kind, args, returns, span, dependency=None):
+    """Keep launch metadata visible while testing only the ctx ABI mutation."""
+    kwargs = {"saved_kwarg": 7}
+    attrs = {
+        "saved_attr": "kept",
+        "arg_directions": [
+            ir.ArgDirection.Scalar if isinstance(arg.type, ir.CommCtxType) else ir.ArgDirection.Input
+            for arg in args
+        ],
+    }
+    if kind == "submit":
+        return ir.Submit(
+            ir.GlobalVar("stage"),
+            args,
+            [dependency] if dependency is not None else [],
+            kwargs,
+            attrs,
+            ir.TupleType([*returns, ir.ScalarType(DataType.TASK_ID)]),
+            span,
+            core_num=ir.ConstInt(2, DataType.INDEX, span),
+            sync_start=True,
+            allow_early_resolve=True,
+            predicate=ir.ConstBool(True, span),
+        )
+    return_type = returns[0] if len(returns) == 1 else ir.TupleType(returns)
+    return ir.Call(ir.GlobalVar("stage"), args, kwargs, attrs, return_type, span)
+
+
+@pytest.mark.parametrize("supplied_out", [False, True])
+def test_c2b_submit_ordinary_out_gap_before_existing_ctx_suffix(supplied_out):
+    """Only an Out tail before the ctx suffix may be omitted from Submit args."""
+    span = _span()
+    dt = _dist_ty()
+    ordinary = ir.TensorType([4], pl.FP32)
+    data, output = ir.Var("data", dt, span), ir.Var("output", ordinary, span)
+    existing = ir.Var("existing", ir.CommCtxType(), span)
+    stage = ir.Function(
+        "stage",
+        [(data, ir.ParamDirection.In), (output, ir.ParamDirection.Out), existing],
+        [ordinary],
+        ir.ReturnStmt([output], span),
+        span,
+        type=ir.FunctionType.InCore,
+    )
+    source, target = ir.Var("source", dt, span), ir.Var("target", ordinary, span)
+    dep = ir.Var("dep", ir.ScalarType(DataType.TASK_ID), span)
+    args = [source, *([target] if supplied_out else []), existing]
+    invocation = _c2b_invocation("submit", args, [ordinary], span, dep)
+    if supplied_out:
+        invocation = ir.Submit(
+            invocation.op,
+            invocation.args,
+            invocation.deps,
+            invocation.kwargs,
+            {
+                **invocation.attrs,
+                "arg_directions": [
+                    ir.ArgDirection.Input,
+                    ir.ArgDirection.OutputExisting,
+                    ir.ArgDirection.Scalar,
+                ],
+            },
+            invocation.type,
+            span,
+            core_num=invocation.core_num,
+            sync_start=True,
+            allow_early_resolve=True,
+            predicate=invocation.predicate,
+        )
+    packed = ir.Var("packed", invocation.type, span)
+    caller = ir.Function(
+        "caller",
+        [source, target, existing, dep],
+        [],
+        ir.RuntimeScopeStmt(
+            manual=True,
+            body=ir.SeqStmts(
+                [
+                    ir.AssignStmt(packed, invocation, span),
+                    ir.ReturnStmt([], span),
+                ],
+                span,
+            ),
+            span=span,
+        ),
+        span,
+        type=ir.FunctionType.Orchestration,
+    )
+    after = passes.materialize_dist_tensor_ctx()(ir.Program([caller, stage], "OutGap", span))
+    caller, stage = _get_func(after, "caller"), _get_func(after, "stage")
+    launch = caller.body.body.stmts[0].value
+    assert isinstance(launch, ir.Submit)
+    assert list(launch.args[:-1]) == args
+    assert launch.args[-1] is caller.params[-1]
+    assert list(stage.param_directions) == [
+        ir.ParamDirection.In,
+        ir.ParamDirection.Out,
+        ir.ParamDirection.In,
+        ir.ParamDirection.In,
+    ]
+    assert len(stage.params) == 4
+    assert list(launch.arg_directions) == [*invocation.arg_directions, ir.ArgDirection.Scalar]
+    assert launch.kwargs["saved_kwarg"] == 7 and launch.attrs["saved_attr"] == "kept"
+    assert launch.deps[0] is dep
+    assert launch.core_num.value == 2
+    assert launch.sync_start and launch.allow_early_resolve and launch.predicate.value
+    assert launch.type.types[0] is ordinary
+    assert launch.type.types[-1].dtype == DataType.TASK_ID
+
+
+@pytest.mark.parametrize("with_existing_ctx", [False, True])
+def test_c2b_omitted_distributed_out_has_no_caller_ctx(with_existing_ctx):
+    """A suffix CommCtx is never provenance for an omitted distributed Out."""
+    span = _span()
+    data, output = ir.Var("data", _dist_ty(), span), ir.Var("output", _dist_ty(), span)
+    existing = ir.Var("existing", ir.CommCtxType(), span)
+    stage = ir.Function(
+        "stage",
+        [
+            (data, ir.ParamDirection.In),
+            (output, ir.ParamDirection.Out),
+            *([existing] if with_existing_ctx else []),
+        ],
+        [output.type],
+        ir.ReturnStmt([output], span),
+        span,
+        type=ir.FunctionType.InCore,
+    )
+    invocation = _c2b_invocation(
+        "submit",
+        [data, *([existing] if with_existing_ctx else [])],
+        [output.type],
+        span,
+    )
+    caller = ir.Function(
+        "caller",
+        [data, *([existing] if with_existing_ctx else [])],
+        [],
+        ir.RuntimeScopeStmt(manual=True, body=ir.EvalStmt(invocation, span), span=span),
+        span,
+        type=ir.FunctionType.Orchestration,
+    )
+    # This is valid Submit ABI, but no runtime-allocation ctx contract exists.
+    # Pin a user-facing limitation rather than an INTERNAL_CHECK or bogus arg.
+    with pytest.raises(ValueError, match="(?i)(omitted|runtime.allocated).*([Cc]omm|context|[Dd]istributed)"):
+        passes.materialize_dist_tensor_ctx()(ir.Program([stage, caller], "OmittedDTOut", span))
+
+
+@pytest.mark.parametrize("kind", ["call", "submit"])
+@pytest.mark.parametrize("result_shape", ["no_dt", "sparse"])
+def test_c2b_result_ctx_preserves_scalar_gaps_and_task_id(kind, result_shape):
+    """Result positions stay stable when only sparse results carry a ctx."""
+    span = _span()
+    data = ir.Var("data", _dist_ty(), span)
+    marker = ir.Var("marker", ir.ScalarType(DataType.INDEX), span)
+    values = [marker, marker] if result_shape == "no_dt" else [marker, data, marker, data]
+    returns = [value.type for value in values]
+    stage = ir.Function(
+        "stage",
+        [data, marker],
+        returns,
+        ir.ReturnStmt(values, span),
+        span,
+        level=ir.Level.CHIP,
+        role=ir.Role.Orchestrator,
+    )
+    invocation = _c2b_invocation(kind, [data, marker], returns, span)
+    # Scalar arguments keep their direction even when ctx scalar args append.
+    attrs = {**invocation.attrs, "arg_directions": [ir.ArgDirection.Input, ir.ArgDirection.Scalar]}
+    if kind == "call":
+        invocation = ir.Call(invocation.op, invocation.args, invocation.kwargs, attrs, invocation.type, span)
+    else:
+        invocation = ir.Submit(
+            invocation.op,
+            invocation.args,
+            [],
+            invocation.kwargs,
+            attrs,
+            invocation.type,
+            span,
+            core_num=invocation.core_num,
+            sync_start=True,
+            allow_early_resolve=True,
+            predicate=invocation.predicate,
+        )
+    packed = ir.Var("packed", invocation.type, span)
+    stmts = [ir.AssignStmt(packed, invocation, span)]
+    if result_shape == "sparse":
+        for index in (1, 3):
+            projected = ir.Var(f"result_{index}", data.type, span)
+            ctx = ir.Var(f"ctx_{index}", ir.CommCtxType(), span)
+            stmts.extend(
+                [
+                    ir.AssignStmt(projected, ir.TupleGetItemExpr(packed, index, span), span),
+                    ir.AssignStmt(
+                        ctx, ir.create_op_call("pld.system.get_comm_ctx", [projected], {}, span), span
+                    ),
+                ]
+            )
+    stmts.append(ir.ReturnStmt([], span))
+    body = ir.SeqStmts(stmts, span)
+    if kind == "submit":
+        body = ir.RuntimeScopeStmt(manual=True, body=body, span=span)
+    caller = ir.Function(
+        "caller",
+        [data, marker],
+        [],
+        body,
+        span,
+        type=ir.FunctionType.Orchestration,
+    )
+    after = passes.materialize_dist_tensor_ctx()(ir.Program([caller, stage], "SparseResults", span))
+    caller = _get_func(after, "caller")
+    rewritten_body = caller.body.body if kind == "submit" else caller.body
+    launch = rewritten_body.stmts[0].value
+    assert isinstance(launch, ir.Submit if kind == "submit" else ir.Call)
+    assert launch.type is invocation.type
+    assert list(launch.arg_directions) == [
+        ir.ArgDirection.Input,
+        ir.ArgDirection.Scalar,
+        ir.ArgDirection.Scalar,
+    ]
+    assert launch.args[-1] is caller.params[-1]
+    assert len(launch.type.types) == len(returns) + (kind == "submit")
+    if kind == "submit":
+        assert launch.type.types[-1].dtype == DataType.TASK_ID
+    if result_shape == "sparse":
+        for offset in (2, 4):
+            assert rewritten_body.stmts[offset].value is caller.params[-1]
+
+
+@pytest.mark.parametrize("payload_kind", ["call", "submit", "query", "query_tuple"])
+def test_c2b_function_expr_attrs_rewrite_ctx_abi(payload_kind):
+    """Expr-valued function attrs must retain the updated ctx ABI."""
+    span = _span()
+    data = ir.Var("data", _dist_ty(), span)
+    stage = ir.Function(
+        "stage",
+        [data],
+        [data.type],
+        ir.ReturnStmt([data], span),
+        span,
+        type=ir.FunctionType.InCore,
+    )
+    query = ir.create_op_call("pld.system.get_comm_ctx", [data], {}, span)
+    payload = (
+        query
+        if payload_kind.startswith("query")
+        else _c2b_invocation(
+            payload_kind,
+            [data],
+            [data.type],
+            span,
+        )
+    )
+    caller = ir.Function(
+        "caller",
+        [data],
+        [],
+        ir.ReturnStmt([], span),
+        span,
+        type=ir.FunctionType.Orchestration,
+        attrs={
+            "saved": ir.MakeTuple([payload], span) if payload_kind == "query_tuple" else payload,
+            "ordinary": "kept",
+        },
+    )
+    after = passes.materialize_dist_tensor_ctx()(ir.Program([stage, caller], "FunctionAttrs", span))
+    caller = _get_func(after, "caller")
+    rewritten = caller.attrs["saved"]
+    assert caller.attrs["ordinary"] == "kept"
+    if payload_kind == "query_tuple":
+        assert isinstance(rewritten, ir.MakeTuple)
+        assert len(rewritten.elements) == 1
+        rewritten = rewritten.elements[0]
+    if payload_kind.startswith("query"):
+        assert rewritten is caller.params[-1]
+    else:
+        assert isinstance(rewritten, ir.Submit if payload_kind == "submit" else ir.Call)
+        assert rewritten.args[0] is caller.params[0]
+        assert rewritten.args[-1] is caller.params[-1]
+        assert len(rewritten.args) == 2
+        assert list(rewritten.arg_directions) == [ir.ArgDirection.Input, ir.ArgDirection.Scalar]
+        assert rewritten.kwargs["saved_kwarg"] == 7
+        assert rewritten.attrs["saved_attr"] == "kept"
+        assert rewritten.type is payload.type
+
+
+def test_c2b_function_attr_requiring_ctx_prefix_reports_unsupported_context():
+    """Attrs have no statement insertion site for a synthesized runtime query."""
+    span = _span()
+    data = ir.Var("data", _dist_ty(), span)
+    stage = ir.Function(
+        "stage",
+        [data],
+        [data.type],
+        ir.ReturnStmt([data], span),
+        span,
+        type=ir.FunctionType.InCore,
+    )
+    buffer = ir.Var("buffer", ir.PtrType(), span)
+    window = ir.create_op_call(
+        "pld.tensor.window",
+        [buffer, ir.MakeTuple([ir.ConstInt(4, DataType.INDEX, span)], span)],
+        {"dtype": pl.FP32},
+        span,
+    )
+    caller = ir.Function(
+        "caller",
+        [buffer],
+        [],
+        ir.ReturnStmt([], span),
+        span,
+        level=ir.Level.HOST,
+        role=ir.Role.Orchestrator,
+        attrs={"saved": _c2b_invocation("call", [window], [data.type], span)},
+    )
+    with pytest.raises(ValueError, match="(?i)(attribute|expression context|prefix)"):
+        passes.materialize_dist_tensor_ctx()(ir.Program([caller, stage], "AttrPrefix", span))
+
+
+@pytest.mark.parametrize("kind", ["call", "submit"])
+def test_c2b_nested_result_ctx_uses_materialized_signature(kind):
+    """Result lookup sees nested ctx suffixes after the base mutator visits args."""
+    span = _span()
+    data = ir.Var("data", _dist_ty(), span)
+    scratch = ir.Var("scratch", ir.TensorType([4], pl.FP32), span)
+    existing = ir.Var("existing", ir.CommCtxType(), span)
+    stage = ir.Function(
+        "stage",
+        [(data, ir.ParamDirection.In), (scratch, ir.ParamDirection.Out), existing],
+        [data.type, scratch.type],
+        ir.ReturnStmt([data, scratch], span),
+        span,
+        type=ir.FunctionType.InCore,
+    )
+    consume = ir.Function(
+        "consume",
+        [data],
+        [],
+        ir.ReturnStmt([], span),
+        span,
+        type=ir.FunctionType.InCore,
+    )
+    args = [data, *([scratch] if kind == "call" else []), existing]
+    nested = _c2b_invocation(kind, args, [data.type, scratch.type], span)
+    if kind == "call":
+        nested = ir.Call(
+            nested.op,
+            nested.args,
+            nested.kwargs,
+            {
+                **nested.attrs,
+                "arg_directions": [
+                    ir.ArgDirection.Input,
+                    ir.ArgDirection.OutputExisting,
+                    ir.ArgDirection.Scalar,
+                ],
+            },
+            nested.type,
+            span,
+        )
+    outer = ir.Call(
+        ir.GlobalVar("consume"),
+        [ir.TupleGetItemExpr(nested, 0, span)],
+        {},
+        {"arg_directions": [ir.ArgDirection.Input]},
+        ir.TupleType([]),
+        span,
+    )
+    body = ir.EvalStmt(outer, span)
+    if kind == "submit":
+        body = ir.RuntimeScopeStmt(manual=True, body=body, span=span)
+    caller = ir.Function(
+        "caller",
+        [data, scratch, existing],
+        [],
+        body,
+        span,
+        type=ir.FunctionType.Orchestration,
+    )
+    after = passes.materialize_dist_tensor_ctx()(ir.Program([stage, caller, consume], "NestedCtx", span))
+    caller = _get_func(after, "caller")
+    body = caller.body.body if kind == "submit" else caller.body
+    outer = body.expr
+    rewritten = outer.args[0].tuple
+    assert isinstance(rewritten, ir.Submit if kind == "submit" else ir.Call)
+    assert list(rewritten.args[:-1]) == args
+    assert rewritten.args[-1] is outer.args[-1] is caller.params[-1]
+    assert list(outer.arg_directions) == [ir.ArgDirection.Input, ir.ArgDirection.Scalar]
+    assert rewritten.type is nested.type
+
+
+@pytest.mark.parametrize("kind", ["call", "submit"])
+@pytest.mark.parametrize("layout", ["empty", "all_scalar", "mixed", "repeated_dt"])
+def test_c2b_wide_shared_result_type_and_tuple_aliases_keep_ctx_positions(kind, layout):
+    """Result width and alias-chain length do not change parameter provenance.
+
+    The same immutable result type is shared by several invocations. Repeated
+    DT positions all return the second input, so confusing return position with
+    input position or capturing the first input's ctx cannot satisfy this case.
+    Scalar returns belong to CHIP orchestration helpers; HOST dispatches to
+    those helpers and forwards the selected contexts to a second CHIP helper.
+    """
+    span = _span()
+    width = 64
+    first, second = ir.Var("first", _dist_ty(), span), ir.Var("second", _dist_ty(), span)
+    marker = ir.Var("marker", ir.ScalarType(DataType.INDEX), span)
+    existing = ir.Var("existing", ir.CommCtxType(), span)
+    dependency = ir.Var("dependency", ir.ScalarType(DataType.TASK_ID), span)
+    values = [] if layout == "empty" else [marker] * width
+    query_positions = []
+    if layout == "mixed":
+        values[1], values[-2] = first, second
+        query_positions = [(1, -2), (width - 2, -1)]
+    elif layout == "repeated_dt":
+        values = [second] * width
+        query_positions = [(0, -1), (width - 1, -1)]
+    returns = [value.type for value in values]
+    stage = ir.Function(
+        "stage",
+        [first, second, marker, existing],
+        returns,
+        ir.ReturnStmt(values, span),
+        span,
+        type=ir.FunctionType.Orchestration,
+    )
+    consumed = ir.Var("consumed", _dist_ty(), span)
+    consumed_ctx = ir.Var("consumed_ctx", ir.CommCtxType(), span)
+    consume = ir.Function(
+        "consume",
+        [consumed],
+        [],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(
+                    consumed_ctx,
+                    ir.create_op_call("pld.system.get_comm_ctx", [consumed], {}, span),
+                    span,
+                ),
+                ir.ReturnStmt([], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.Orchestration,
+    )
+    result_type = ir.TupleType([*returns, *([dependency.type] if kind == "submit" else [])])
+    statements = []
+    expected_contexts = {}
+    directions = [
+        ir.ArgDirection.Input,
+        ir.ArgDirection.Input,
+        ir.ArgDirection.Scalar,
+        ir.ArgDirection.Scalar,
+    ]
+    for site in range(3):
+        args = [first, second, marker, existing]
+        attrs = {
+            "arg_directions": directions,
+            "ordinary": "kept",
+            "worker": ir.ConstInt(0, DataType.INDEX, span),
+        }
+        if kind == "submit":
+            invocation = ir.Submit(
+                ir.GlobalVar("stage"),
+                args,
+                [dependency],
+                {},
+                attrs,
+                result_type,
+                span,
+            )
+        else:
+            invocation = ir.Call(ir.GlobalVar("stage"), args, {}, attrs, result_type, span)
+        packed = ir.Var(f"packed_{site}", result_type, span)
+        statements.append(ir.AssignStmt(packed, invocation, span))
+        alias = packed
+        for depth in range(6):
+            fresh = ir.Var(f"alias_{site}_{depth}", result_type, span)
+            statements.append(ir.AssignStmt(fresh, alias, span))
+            alias = fresh
+        for position, ctx_param in query_positions:
+            projected = ir.Var(f"result_{site}_{position}", values[position].type, span)
+            statements.extend(
+                [
+                    ir.AssignStmt(projected, ir.TupleGetItemExpr(alias, position, span), span),
+                    ir.EvalStmt(
+                        ir.Call(
+                            ir.GlobalVar("consume"),
+                            [projected],
+                            {},
+                            {
+                                "arg_directions": [ir.ArgDirection.Input],
+                                "worker": ir.ConstInt(0, DataType.INDEX, span),
+                            },
+                            ir.TupleType([]),
+                            span,
+                        ),
+                        span,
+                    ),
+                ]
+            )
+            expected_contexts[projected.name_hint] = ctx_param
+    statements.append(ir.ReturnStmt([], span))
+    body = ir.SeqStmts(statements, span)
+    if kind == "submit":
+        body = ir.RuntimeScopeStmt(manual=True, body=body, span=span)
+    caller = ir.Function(
+        "caller",
+        [first, second, marker, existing, dependency],
+        [],
+        body,
+        span,
+        level=ir.Level.HOST,
+        role=ir.Role.Orchestrator,
+    )
+    after = passes.materialize_dist_tensor_ctx()(ir.Program([stage, caller, consume], "SharedResults", span))
+    caller = _get_func(after, "caller")
+    assignments = _collect_assign_stmts(caller.body)
+    launches = [assign.value for assign in assignments if assign.var.name_hint.startswith("packed_")]
+    assert len(launches) == 3
+    for launch in launches:
+        assert isinstance(launch, ir.Submit if kind == "submit" else ir.Call)
+        assert launch.type is result_type
+        assert list(launch.args[-2:]) == list(caller.params[-2:])
+        assert list(launch.arg_directions) == [*directions, ir.ArgDirection.Scalar, ir.ArgDirection.Scalar]
+        assert launch.attrs["ordinary"] == "kept"
+        if kind == "submit":
+            assert launch.deps[0] is dependency
+            assert launch.type.types[-1].dtype == DataType.TASK_ID
+    consumers = _collect_calls(caller.body, "consume")
+    assert len(consumers) == len(expected_contexts)
+    for call in consumers:
+        assert call.args[-1] is caller.params[expected_contexts[call.args[0].name_hint]]
+        assert call.attrs["worker"].value == 0
+    consume = _get_func(after, "consume")
+    assert consume.body.stmts[0].value is consume.params[-1]
+    aliases = [assign for assign in assignments if assign.var.name_hint.startswith("alias_")]
+    assert len(aliases) == 18
+    assert all(assign.var.type is assign.value.type is result_type for assign in aliases)
+
+
+@pytest.mark.parametrize("kind", ["call", "submit"])
+@pytest.mark.parametrize("metadata", ["shape", "memref", "view"])
+def test_c2b_result_types_preserve_dynamic_metadata_on_ctx_rewrite(kind, metadata):
+    """Nonliteral type fields retain normal base-mutator traversal semantics."""
+    span = _span()
+    dim = ir.Var("dim", ir.ScalarType(DataType.INDEX), span)
+    base = ir.Var("storage", ir.PtrType(), span)
+    data = ir.Var("data", _dist_ty(), span)
+    memref = ir.MemRef(base, dim, 64, span) if metadata == "memref" else None
+    view = (
+        ir.TensorView(
+            stride=[dim], layout=ir.TensorLayout.ND, valid_shape=[ir.ConstInt(2, DataType.INDEX, span)]
+        )
+        if metadata == "view"
+        else None
+    )
+    ordinary_type = ir.TensorType([dim] if metadata == "shape" else [4], pl.FP32, memref, view)
+    ordinary = ir.Var("ordinary", ordinary_type, span)
+    params = [dim, base, data, ordinary]
+    directions = [
+        ir.ArgDirection.Scalar,
+        ir.ArgDirection.Scalar,
+        ir.ArgDirection.Input,
+        ir.ArgDirection.Input,
+    ]
+    stage = ir.Function(
+        "stage",
+        params,
+        [ordinary_type, data.type],
+        ir.ReturnStmt([ordinary, data], span),
+        span,
+        type=ir.FunctionType.InCore,
+    )
+    result_type = ir.TupleType(
+        [
+            ordinary_type,
+            data.type,
+            *([ir.ScalarType(DataType.TASK_ID)] if kind == "submit" else []),
+        ]
+    )
+    attrs = {"arg_directions": directions}
+    invocation = (
+        ir.Submit(ir.GlobalVar("stage"), params, [], {}, attrs, result_type, span)
+        if kind == "submit"
+        else ir.Call(ir.GlobalVar("stage"), params, {}, attrs, result_type, span)
+    )
+    packed = ir.Var("packed", result_type, span)
+    output = ir.Var("output", ordinary_type, span)
+    returned = ir.Var("returned", data.type, span)
+    context = ir.Var("context", ir.CommCtxType(), span)
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(packed, invocation, span),
+            ir.AssignStmt(output, ir.TupleGetItemExpr(packed, 0, span), span),
+            ir.AssignStmt(returned, ir.TupleGetItemExpr(packed, 1, span), span),
+            ir.AssignStmt(context, ir.create_op_call("pld.system.get_comm_ctx", [returned], {}, span), span),
+            ir.ReturnStmt([], span),
+        ],
+        span,
+    )
+    if kind == "submit":
+        body = ir.RuntimeScopeStmt(manual=True, body=body, span=span)
+    caller = ir.Function("caller", params, [], body, span, type=ir.FunctionType.Orchestration)
+    before = ir.Program([stage, caller], "DynamicMetadata", span)
+    props = passes.IRPropertySet()
+    for prop in (
+        passes.IRProperty.TypeChecked,
+        passes.IRProperty.AssignTypeSymmetry,
+        passes.IRProperty.NoScalarKernelReturn,
+    ):
+        props.insert(prop)
+    assert passes.PropertyVerifierRegistry.verify(props, before) == []
+    after = passes.materialize_dist_tensor_ctx()(before)
+    assert passes.PropertyVerifierRegistry.verify(props, after) == []
+    caller = _get_func(after, "caller")
+    body = caller.body.body if kind == "submit" else caller.body
+    launch = body.stmts[0].value
+    assert isinstance(launch, ir.Submit if kind == "submit" else ir.Call)
+    assert launch.type is result_type
+    assert launch.args[-1] is body.stmts[3].value is caller.params[-1]
+    assert list(launch.arg_directions) == [*directions, ir.ArgDirection.Scalar]
+    restored_type = launch.type.types[0]
+    assert restored_type is body.stmts[1].var.type is body.stmts[1].value.type is ordinary_type
+    if metadata == "shape":
+        assert restored_type.shape[0] is caller.params[0]
+    elif metadata == "memref":
+        assert restored_type.memref is memref
+        assert restored_type.memref.base_ is caller.params[1]
+        assert restored_type.memref.byte_offset_ is caller.params[0]
+    else:
+        assert restored_type.tensor_view.stride[0] is caller.params[0]
+        assert restored_type.tensor_view.valid_shape[0].value == 2
+        assert restored_type.tensor_view.layout == ir.TensorLayout.ND
+    if kind == "submit":
+        assert launch.type.types[-1].dtype == DataType.TASK_ID
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

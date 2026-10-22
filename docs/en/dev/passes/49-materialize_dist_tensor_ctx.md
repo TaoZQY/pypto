@@ -5,9 +5,10 @@ Materializes one explicit `CommCtxType` parameter and argument for each
 
 ## Overview
 
-Distributed tensors need a communication context at every dispatch boundary:
-host orchestration passes a per-rank `device_ctx`, L2 orchestration forwards it
-through task args, and L1 PTO codegen uses it to lower `pld.system.rank`,
+Distributed tensors need a communication context at every dispatch boundary,
+including the CLUSTER_0 (L4) → HOST (L3) → CHIP (L2) chain. Host orchestration
+passes a per-rank `device_ctx`, L2 orchestration forwards it through task args,
+and L1 PTO codegen uses it to lower `pld.system.rank`,
 `pld.system.nranks`, `notify`, `wait`, `put`, and remote memory ops.
 
 Older codegen paths synthesized those ctx values independently at several
@@ -30,18 +31,62 @@ sites. This pass makes the ctx flow explicit in IR instead:
    (`tensor.view`, `tile.slice`, `tensor.reshape`, ...), whose result type
    propagates `DistributedTensorType::window_buffer_` from `args[0]`.
    Tensor aliases carried through `ForStmt` / `WhileStmt` are tracked as well.
-   In host orchestration only, if the lineage cannot be resolved, bind
+   In HOST or CLUSTER_0 orchestration, if the lineage cannot be resolved, bind
    `pld.system.get_comm_ctx(dist)` immediately before the call and pass that
    result. Chip orchestration and device functions must resolve an explicit
    context; an unresolved argument is diagnosed instead of synthesizing a
    device-side query.
 3. In chip orchestration and device functions, replace every
    `pld.system.get_comm_ctx(dist)` with the resolved explicit `CommCtxType` SSA
-   value. Host orchestration keeps the op because host codegen resolves it from
-   the window's per-rank runtime context.
+   value. HOST and CLUSTER_0 orchestrators keep the op. HOST codegen resolves it
+   from the window's per-rank runtime context; interpreting a CLUSTER_0 context
+   at runtime belongs to subsequent lowering.
 4. If call-site `arg_directions` are already resolved, append matching
    `ArgDirection::Scalar` entries so downstream codegen can keep treating ctx as
    ordinary scalar task payload.
+
+`Submit` arguments retain their canonical layout: a caller-supplied prefix,
+followed by the existing and newly appended `CommCtx` suffix. The only omitted
+parameters form a contiguous `Out` gap immediately before that suffix. For
+example, original parameters `[data, scratch: Out[Tensor], existing_ctx]` and
+arguments `[data, existing_ctx]` become parameters
+`[data, scratch, existing_ctx, data_ctx]` and arguments
+`[data, existing_ctx, data_ctx]`. A supplied `Out` is real caller provenance;
+an omitted `DistributedTensor` `Out` has no caller context and is diagnosed as
+unsupported. This pass does not allocate a runtime context for that output.
+The pass caches each original signature, arity, and trailing-context count
+before extending any signature. Alias analysis binds original calls against
+those facts; result lookup in recursively rewritten argument expressions uses
+the extended signature and suffix. An argument count alone cannot distinguish
+these stages when an `Out` gap is present.
+
+Result provenance uses one original-position map per callee. A call returning
+distributed tensors captures only the contexts of distinct returned DT
+parameters, bounded by its supplied arguments, and tuple aliases share that
+immutable capture. Scalar-only and empty returns allocate no result-context
+capture. Direct nested projections resolve only their requested position;
+repeating one DT parameter across a wide return tuple does not allocate or
+resolve a context for every return field at every call site.
+
+The pass also classifies immutable shared result-type DAGs once. Scalar/tuple
+trees and Tensor/DistributedTensor metadata containing only integer literals,
+without a MemRef, can skip the base type walk because this pass cannot rewrite
+those leaves. The classification follows the canonical shape/view walker and
+keeps window ownership opaque. It caches only this proof, not rewritten types:
+MemRefs, dynamic shape/stride expressions, Vars, IterArgs, queries, and unknown
+types retain the normal state-sensitive base traversal. Repeated uses of those
+unsafe shared types may still repeat their metadata walk.
+
+Expr-valued function attributes are rewritten by stored type, including
+supported expression containers, so their calls, submits, and context queries
+retain the updated ABI. Attributes have no statement insertion point: a call
+there must resolve its context from existing formal/alias lineage, or receive a
+clear unsupported-context diagnostic. Ordinary metadata, call kwargs, return
+positions, argument directions, and Submit launch/dependency fields are
+preserved. This pass does not register a CLUSTER_0 level handler or change the
+HOST-only collective and signal lowering contracts.
+Binary roundtrips preserve shared window references in function bodies and
+metadata, including locally owned slots first defined by a body expression.
 
 This pass does not add `CommCtxType` values to `IfStmt` return variables or
 branch yields. DistributedTensor `if` lowering keeps the existing requirement
@@ -57,10 +102,11 @@ init value's context. A yield whose lineage this pass cannot trace at all leaves
 the seed in place.
 
 The pass produces `IRProperty::DistTensorCtxMaterialized`: no
-`pld.system.get_comm_ctx` survives outside host orchestration. The pass enforces
-this for every function it rewrites, and the property verifier checks it
-independently — which also covers Programs the pass returns untouched because no
-function declares a `DistributedTensorType` parameter. The property is listed in
+`pld.system.get_comm_ctx` survives outside HOST or CLUSTER_0 orchestration. The
+pass enforces this for every function it rewrites, and the property verifier
+checks it independently, including Expr-valued function attributes. This also
+covers Programs the pass returns untouched because no function declares a
+`DistributedTensorType` parameter. The property is listed in
 `GetVerifiedProperties()`, so the pipeline checks it on the default verification
 level rather than only when a test installs a `VerificationInstrument`.
 
@@ -121,5 +167,5 @@ def host_orch(self):
 
 The kernel body does not need to change. Existing
 `pld.system.get_comm_ctx(data)` uses in a device function are rewritten to the
-explicit ctx parameter by this pass; host-orchestration uses remain runtime
-queries.
+explicit ctx parameter by this pass; HOST and CLUSTER_0 orchestration uses remain
+runtime queries.

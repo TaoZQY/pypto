@@ -16,6 +16,7 @@ from typing import cast
 import pypto.language as pl
 import pytest
 from pypto import DataType, ir
+from pypto.ir import IRBuilder
 from pypto.pypto_core import passes
 
 
@@ -276,6 +277,121 @@ class TestCommDomainScopeStmtSerialization:
         ir.assert_structural_equal(scope, restored, enable_auto_mapping=True)
         assert [s.name_hint for s in restored.slots] == ["a", "b", "c"]
         assert [cast(ir.ConstInt, s.size).value for s in restored.slots] == [256, 512, 1024]
+
+
+@pytest.mark.parametrize("definition_order", ["standalone_scope", "owner_first", "consumer_first"])
+def test_c2b_comm_domain_serde_body_defines_slot_before_slots_field(definition_order):
+    """A scope's body can introduce a WindowBuffer before its slots refer to it.
+
+    Reflection visits body and attrs before slots. A consumer whose name sorts
+    first happens to define the same WindowBuffer earlier in its formal type;
+    the owner-first and standalone cases must not depend on that accident.
+    """
+    span = ir.Span.unknown()
+    dim = ir.ConstInt(4, DataType.INDEX, span)
+    size = ir.ConstInt(16, DataType.INDEX, span)
+    base = ir.Var("owned_buffer", ir.PtrType(), span)
+    slot = ir.WindowBuffer(base, size, load_from_host=True, store_to_host=True)
+    tensor_type = ir.DistributedTensorType([dim], DataType.FP32, None, None, slot)
+    data = ir.Var("data", tensor_type, span)
+    owner_name, consumer_name = (
+        ("z_owner", "a_consumer") if definition_order == "consumer_first" else ("a_owner", "z_consumer")
+    )
+    alloc = ir.create_op_call("pld.tensor.alloc_window_buffer", [size], {"name": "owned_buffer"}, span)
+    # This is the type attached by domain materialization, including its owned
+    # slot. Both sides of the assignment therefore have the same native type.
+    window = ir.Call(
+        ir.get_op("pld.tensor.window"),
+        [base, ir.MakeTuple([dim], span)],
+        {"dtype": DataType.FP32},
+        {},
+        tensor_type,
+        span,
+    )
+    dispatch = ir.Call(
+        ir.GlobalVar(consumer_name),
+        [data],
+        {},
+        {"worker": ir.ConstInt(0, DataType.INDEX, span), "arg_directions": [ir.ArgDirection.Input]},
+        ir.TupleType([]),
+        span,
+    )
+    builder = IRBuilder()
+    with builder.function(owner_name, span, level=ir.Level.HOST, role=ir.Role.Orchestrator) as function:
+        with builder.comm_domain_scope(
+            [0],
+            [slot],
+            "owned_domain",
+            span,
+            attrs=[("ordinary", "kept"), ("count", 7), ("dimensions", ir.MakeTuple([dim, size], span))],
+        ) as scope_builder:
+            builder.assign(base, alloc, span)
+            builder.assign(data, window, span)
+            builder.eval_stmt(dispatch, span)
+            builder.return_stmt(None, span)
+    owner = function.get_result()
+    formal = ir.Var("formal", tensor_type, span)
+    consumer = ir.Function(
+        consumer_name,
+        [formal],
+        [],
+        ir.ReturnStmt([], span),
+        span,
+        level=ir.Level.CHIP,
+        role=ir.Role.Orchestrator,
+    )
+    program = ir.Program([owner, consumer], "DomainDefinitionOrder", span)
+    props = passes.IRPropertySet()
+    props.insert(passes.IRProperty.AssignTypeSymmetry)
+    props.insert(passes.IRProperty.TypeChecked)
+    assert passes.PropertyVerifierRegistry.verify(props, program) == []
+    before = scope_builder.get_result() if definition_order == "standalone_scope" else program
+    restored = ir.deserialize(ir.serialize(before))
+    ir.assert_structural_equal(before, restored, enable_auto_mapping=True)
+    # Outside a Function, the WindowBuffer has free resource identity. Match
+    # comparison options when hashing its reconstructed serialization peer.
+    assert ir.structural_hash(before, enable_auto_mapping=True) == ir.structural_hash(
+        restored, enable_auto_mapping=True
+    )
+    if isinstance(restored, ir.Program):
+        assert passes.PropertyVerifierRegistry.verify(props, restored) == []
+        owner = restored.functions[restored.get_global_var(owner_name)]
+        scope = owner.body
+        if isinstance(scope, ir.SeqStmts):
+            assert len(scope.stmts) == 1
+            scope = scope.stmts[0]
+        consumer = restored.functions[restored.get_global_var(consumer_name)]
+    else:
+        scope = restored
+    assert isinstance(scope, ir.CommDomainScopeStmt)
+    assert scope.name_hint == "owned_domain"
+    assert list(scope.devices) == [0]
+    assert len(scope.slots) == 1
+    slot = scope.slots[0]
+    assert slot.load_from_host and slot.store_to_host
+    assert isinstance(scope.body, ir.SeqStmts)
+    base_assign, data_assign, invocation, returned = scope.body.stmts
+    assert slot.base is base_assign.var is data_assign.value.args[0]
+    assert slot.size is base_assign.value.args[0]
+    assert data_assign.var.type.window_buffer is data_assign.value.type.window_buffer is slot
+    assert invocation.expr.args[0] is data_assign.var
+    assert isinstance(returned, ir.ReturnStmt)
+    assert scope.attrs["ordinary"] == "kept" and scope.attrs["count"] == 7
+    dimensions = scope.attrs["dimensions"]
+    assert isinstance(dimensions, ir.MakeTuple)
+    assert data_assign.var.type.shape[0] is data_assign.value.args[1].elements[0] is dimensions.elements[0]
+    assert dimensions.elements[1] is slot.size
+    assert dimensions.elements[0].value == 4 and slot.size.value == 16
+    if isinstance(restored, ir.Program):
+        assert consumer.params[0].type.window_buffer is slot
+        assert consumer.params[0].type.shape[0] is dimensions.elements[0]
+
+
+def test_c2b_comm_domain_serde_does_not_accept_unknown_references():
+    """Definition-order fixes must retain strict rejection of undefined IDs."""
+    # MessagePack {"ref": 127}, with no preceding definition in the graph.
+    with pytest.raises(ValueError, match="Invalid reference ID: 127"):
+        ir.deserialize(b"\x81\xa3ref\x7f")
 
 
 class TestCapturedScopeAttrSerialization:

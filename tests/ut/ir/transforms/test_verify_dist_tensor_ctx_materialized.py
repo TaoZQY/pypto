@@ -10,7 +10,7 @@
 """Unit tests for the DistTensorCtxMaterialized property verifier.
 
 ``MaterializeDistTensorCtx`` replaces every ``pld.system.get_comm_ctx`` outside
-host orchestration with the explicit ``CommCtxType`` parameter, because device
+HOST/CLUSTER_0 orchestration with the explicit ``CommCtxType`` parameter, because device
 and chip-orchestration codegen have no runtime representation for the query.
 The pass enforces that for every function it rewrites; this verifier checks the
 invariant independently, which also covers the Programs the pass returns
@@ -91,6 +91,41 @@ def test_program_without_get_comm_ctx_passes():
             return x
 
     assert _errors(P) == []
+
+
+@pytest.mark.parametrize("level", [ir.Level.HOST, ir.Level.CLUSTER_0])
+def test_c2b_runtime_query_owner_is_allowed_without_handler_registration(level):
+    """Context-query authorization follows execution level, not LevelHandler."""
+    owner = _get_ctx_function("owner", level=level, role=ir.Role.Orchestrator)
+    assert _errors(ir.Program([owner], "runtime_query_owner", _span())) == []
+
+
+@pytest.mark.parametrize("level", [ir.Level.CHIP, ir.Level.CHIP_DIE])
+def test_c2b_unresolved_query_below_host_is_rejected(level):
+    function = _get_ctx_function("below_host", level=level, role=ir.Role.Orchestrator)
+    errors = _errors(ir.Program([function], "unresolved_query", _span()))
+    assert len(errors) == 1
+    assert "below_host" in errors[0].message
+    assert "pld.system.get_comm_ctx" in errors[0].message
+
+
+def test_c2b_verifier_visits_function_attribute_query():
+    """Attribute-only expressions must obey the same independent property."""
+    span = _span()
+    data = ir.Var("data", ir.DistributedTensorType([4], pl.FP32), span)
+    query = ir.create_op_call("pld.system.get_comm_ctx", [data], {}, span)
+    kernel = ir.Function(
+        "kernel",
+        [data],
+        [],
+        ir.ReturnStmt([], span),
+        span,
+        type=ir.FunctionType.InCore,
+        attrs={"saved_query": query},
+    )
+    errors = _errors(ir.Program([kernel], "attribute_query", span))
+    assert len(errors) == 1
+    assert "pld.system.get_comm_ctx" in errors[0].message
 
 
 def test_property_is_verified_on_the_default_path():
