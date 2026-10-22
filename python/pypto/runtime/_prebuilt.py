@@ -114,29 +114,40 @@ def write_chip_binaries(
     (directory / BINARY_MANIFEST).write_bytes(encode_manifest(record))
 
 
-def _require_supported_directory(directory: Path, validated_entry_kind: str | None = None) -> None:
-    """L4 has no flat HOST/CHIP binary layout until cluster codegen lands."""
-    if validated_entry_kind == "cluster":
-        raise NotImplementedError(
-            "Cluster/POD (L4) compilation/loading is unsupported until cluster runner integration"
-        )
+def _require_supported_directory(
+    directory: Path, validated_entry_kind: str | None = None
+) -> dict[str, Any] | None:
+    """Separate parent artifact readiness from the still-gated L4 execution path."""
     if validated_entry_kind in {"host", "chip"}:
-        return
+        return None
     if (directory / "distributed_meta.json").is_file():
         from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
 
-        DistributedCompiledProgram.from_dir(directory)._require_supported_execution()
+        compiled = DistributedCompiledProgram.from_dir(directory)
+        compiled._require_artifact_ready()
+        return compiled.l3_entries
+    if validated_entry_kind == "cluster":
+        raise ValueError(f"Cluster artifact requires distributed_meta.json: {directory}")
+    return None
 
 
 def chip_directories(
     directory: Path, kind: BuildKind, *, _validated_entry_kind: str | None = None
 ) -> dict[str, Path]:
     """Enumerate all supported chip sub-builds without executing configuration."""
-    _require_supported_directory(directory, _validated_entry_kind)
+    entries = _require_supported_directory(directory, _validated_entry_kind)
     if kind is BuildKind.SINGLE_CHIP:
         if not (directory / "kernel_config.py").is_file():
             raise ValueError(f"Single-chip artifact lacks kernel_config.py: {directory}")
         return {".": directory}
+    if entries is not None:
+        result: dict[str, Path] = {}
+        for entry in entries["entries"]:
+            for path in entry["chip_paths"].values():
+                result[path] = _relative_file(directory, f"{path}/kernel_config.py").parent
+        if not result:
+            raise ValueError(f"Cluster artifact l3_entries has no chip builds: {directory}")
+        return dict(sorted(result.items()))
     children = directory / "next_levels"
     result: dict[str, Path] = {}
     for child in sorted(children.iterdir()):

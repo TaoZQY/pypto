@@ -11,6 +11,7 @@
 
 import ast
 import inspect
+import json
 import re
 from types import SimpleNamespace
 
@@ -2567,6 +2568,115 @@ def test_c3b_embedded_control_flow_rejects_unresolved_ctx_before_dispatch(mode):
     program = _c3b_control_flow_program(mode)
     with pytest.raises(ValueError, match=r"(?i)embedded.*CommCtx.*(formal|query|carry|phi|ambiguous)"):
         codegen.DistributedCodegen()._generate_embedded(program, entry_name="node")
+
+
+def _c3c_emit_entry_metadata(program, root, *, local_device_count=2):
+    """Persist actual native HOST metadata without asserting CHIP compilation.
+
+    C3b fixtures intentionally keep Opaque CHIP callees to test native HOST
+    semantics. The recursive backend tests separately use real Orchestration
+    CHIP functions; do not silently retag these fixtures for PTO generation.
+    """
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910)
+    try:
+        files = {"orchestration/cluster_orch.py": codegen.DistributedCodegen().generate(program)}
+        for function in program.functions.values():
+            if function.level == ir.Level.HOST and function.role == ir.Role.Orchestrator:
+                files[f"next_levels/{function.name}/orchestration/host_orch.py"] = (
+                    codegen.DistributedCodegen()._generate_embedded(program, entry_name=function.name)
+                )
+    finally:
+        backend.reset_for_testing()
+    for name, text in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    config = ir.ClusterConfig(
+        [
+            ir.ClusterNodeSpec("node-a", list(range(local_device_count))),
+            ir.ClusterNodeSpec("node-b", list(range(local_device_count, local_device_count * 2))),
+        ],
+        "/env/bin/python",
+    )
+    ir.DistributedCompiledProgram(program, str(root), cluster_config=config)
+    return json.loads((root / "distributed_meta.json").read_text())
+
+
+def test_c3c_cold_window_geometry_is_versioned_beside_unchanged_native_layout(tmp_path):
+    # Keep the actual lowered offsets/strides fixture: neither the eight-field
+    # v1 row nor a packed shape is sufficient to reconstruct these descriptors.
+    program = _c3b_dt_geometry_program()
+    native = _c3b_embedded_layout(codegen.DistributedCodegen()._generate_embedded(program, entry_name="node"))
+    metadata = _c3c_emit_entry_metadata(program, tmp_path)
+    entry = metadata["l3_entries"]["entries"][0]
+    assert entry["entry_name"] == "node"
+    assert entry["layout"] == json.loads(json.dumps(native))
+    assert native["version"] == 1 and all(len(row) == 8 for row in native["window_slots"])
+    assert native["tensor_slots"] == () and len(native["scalar_slots"]) == 2
+    assert [row[0] for row in native["window_slots"]] == [0, 1]
+    assert [row[2:4] for row in native["window_slots"]] == [(2, 0), (3, 1)]
+    assert entry["view_geometry"] == {
+        "version": 1,
+        "window_slots": [
+            {"formal_index": 0, "strides": [8, 1], "byte_offset": 36},
+            {"formal_index": 1, "strides": [8, 1], "byte_offset": 68},
+        ],
+    }
+    # Prefix CommCtx and DT suffix positions remain explicit in layout, and
+    # restoring this record does not require the original native Program.
+    restored = ir.DistributedCompiledProgram.from_dir(tmp_path)
+    assert restored.program is None and restored.entry_kind == "cluster"
+
+
+@pytest.mark.parametrize("mutation", ["missing_view", "duplicate_view", "bool_offset", "bad_stride"])
+def test_c3c_cold_window_geometry_rejects_incomplete_or_malformed_views(tmp_path, mutation):
+    metadata = _c3c_emit_entry_metadata(_c3b_dt_geometry_program(), tmp_path)
+    views = metadata["l3_entries"]["entries"][0]["view_geometry"]["window_slots"]
+    if mutation == "missing_view":
+        views.pop()
+    elif mutation == "duplicate_view":
+        views[1]["formal_index"] = views[0]["formal_index"]
+    elif mutation == "bool_offset":
+        views[0]["byte_offset"] = True
+    else:
+        views[0]["strides"] = [8]
+    (tmp_path / "distributed_meta.json").write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match=r"distributed_meta\.json.*(view|geometry|l3_entries)"):
+        ir.DistributedCompiledProgram.from_dir(tmp_path)
+
+
+def test_c3c_cold_metadata_keeps_real_prefork_return_copy_and_storage_requirements(tmp_path):
+    program = _c3b_tensor_return_program("internal")
+    native = _c3b_embedded_layout(codegen.DistributedCodegen()._generate_embedded(program, entry_name="node"))
+    metadata = _c3c_emit_entry_metadata(program, tmp_path)
+    entry = metadata["l3_entries"]["entries"][0]
+    assert entry["layout"] == json.loads(json.dumps(native))
+    requirements = entry["layout"]["prefork_requirements"]
+    assert any(row[0] == "tensor_storage" for row in requirements)
+    assert any(row[0] == "return_copy_subworker" for row in requirements)
+    assert entry["return_copy_callable"] == {
+        "module": "orchestration._distributed_support",
+        "qualname": "_copy_return_tensor",
+    }
+    assert entry["minimum_sub_workers"] >= 1
+    assert entry["layout"]["implicit_outputs"]
+
+
+@pytest.mark.parametrize("mode", ["distinct", "local"])
+def test_c3c_cold_metadata_keeps_original_ctx_prefix_dt_suffix_and_domain_tokens(tmp_path, mode):
+    program = _c3b_domain_program(mode)
+    source = codegen.DistributedCodegen()._generate_embedded(program, entry_name="node")
+    native = _c3b_embedded_layout(source)
+    metadata = _c3c_emit_entry_metadata(program, tmp_path, local_device_count=4)
+    entry = metadata["l3_entries"]["entries"][0]
+    assert entry["layout"] == json.loads(json.dumps(native))
+    assert [row[0] for row in native["scalar_slots"]] == [1, 5, 6, 7]
+    assert [row[2:4] for row in native["window_slots"]] == [(6, 2), (7, 3)]
+    assert ("inherited_domain_tokens", 3) in native["prefork_requirements"]
+    assert entry["local_device_count"] == 4
+    if mode == "local":
+        assert any(row[0] == "local_domain_tokens" for row in native["prefork_requirements"])
 
 
 if __name__ == "__main__":

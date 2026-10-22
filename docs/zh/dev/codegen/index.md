@@ -51,8 +51,8 @@ CLUSTER 的 `for` 循环在循环前绑定 SSA 携带值，在回边并行更新
 独立于入口绑定节点数，并通过现有标量定义解析器处理形状中的直接 `num_workers()` 查询
 及其 SSA 别名。HOST 的循环发射与 `_alloc_intermediates(tensors, world_size=1)` ABI 保持不变。
 
-CLUSTER 当前只支持内部生成源码。公共 L4 编译、产物执行和 runner 继续保留闸门，
-待递归入口元数据、嵌入式 HOST 入口与 runner 集成完成后逐步开放。
+CLUSTER_0 支持编译与父进程产物准备，并保存递归入口元数据和嵌入式 HOST 源码。
+L4 执行继续保留闸门，等待 runner 集成完成。
 `_io_arg` 由后续集成绑定；codegen 不导入尚不存在的 runner。
 L4 的 `world_size` 和集合通信仍不支持。存在 handler 不代表放开更高层级或跨层跳级调用。
 
@@ -168,7 +168,35 @@ base 应是所属 WindowBuffer 的同一 base。函数局部来源仅允许一�
 无法解析的来源在生成阶段给出诊断，不增加标量线值。
 内部存储必须具有常量形状，并在初始化前准备；
 动态形参几何信息不授权动态存储分配。
-递归打包与实际启动集成也尚未完成；公共 L4 编译与执行闸门继续保留。
+CLUSTER_0 已支持递归源码打包；L4 执行仍等待节点启动与输入输出路由集成。
+
+## 递归 CLUSTER 产物
+
+CLUSTER_0 编译生成 `orchestration/cluster_orch.py`，并为每个可达 HOST 生成
+`next_levels/<host>/` 子树。HOST 保留私有原生 `(orch, args, config)` 入口，
+其 CHIP 子构建位于 `next_levels/<host>/next_levels/<chip>/`，同时保存 HOST
+子工作者（SubWorker）源码。共享 CHIP 函数名仍保留独立的完整逻辑注册路径；
+不可达函数和遗留目录不会成为额外依赖。普通 HOST 和 schema-3 元数据格式保持兼容。
+
+Schema-4 的 `l3_entries` 闭包版本 1 保存相对模块与限定名、原生布局版本 1、
+分别稠密的张量/标量索引、省略的分布式窗口与最终 CommCtx 配对、形状与方向、
+派生前（prefork）存储和域令牌需求、本地设备数及最少子工作者数。
+独立的 `view_geometry` 版本 1 保存窗口步长与字节偏移；原生窗口行仍为八字段。
+返回张量复制显式记录规范辅助函数。冷恢复（cold restoration）严格校验字段，
+不执行源码。仅含标识的旧 schema-4 记录仍可读取，但缺少版本化闭包时不能准备产物。
+
+父进程根据声明的完整路径编译 CHIP 并提升预构建产物（prebuilt artifact）。
+`runtime._artifact_sources.build_cluster_source_bundle` 返回 SHA-256 摘要和确定性
+gzip 压缩的 USTAR 字节，包含归属明确的运行时源码、冷元数据及路径/大小/摘要清单。
+唯一的规范中立辅助模块位于根 `orchestration/`；HOST 包通过相对导入转导出它。
+安装时指定外层摘要命名空间，摘要不写入源码；产物可直接交给 R1
+`StartupArtifactSpec` 的读取、安装和激活接口。在解析源码之前，生成端先校验路径
+可移植性，并将单个文件限制为 64 MiB、总解包内容限制为 256 MiB、含清单的成员数量
+限制为 4096。流式 gzip 输出（含结束尾部）限制为 64 MiB。所有平台均拒绝 Windows
+保留名称和大小写折叠后的路径别名。安装后的源码仅使用已注册的 CHIP
+句柄，不导入 PyPTO、不寻找编译器、不执行 `kernel_config.py`，也不调用
+`ArtifactRuntime.load`。父进程仍可使用这些编译与组装设施。L4 执行继续受保护，
+CLUSTER_1 及更高层的编译仍不支持。
 
 ## 另请参阅
 

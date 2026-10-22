@@ -110,8 +110,8 @@ class ClusterConfig:
     counts per entry are supported by the initial shape/layout contract.
 
     The launcher and Python executable are explicit strings; this configuration
-    performs no discovery or network operations. Full POD compilation remains
-    unsupported until cluster codegen and runner integration are implemented.
+    performs no discovery or network operations. CLUSTER_0 compilation captures
+    recursive artifacts; execution remains gated until runner integration.
     """
 
     nodes: list[ClusterNodeSpec]
@@ -417,6 +417,7 @@ class DistributedCompiledProgram:
         _output_indices: list[int] | None = None,
         _return_types: list[Any] | None = None,
         _execution_capabilities: ExecutionCapabilities = ExecutionCapabilities(),
+        _l3_entries: dict[str, Any] | None = None,
     ) -> None:
         # ``program`` is the post-pass IR. The runtime needs post-pass IR for
         # orchestrator metadata (post-SSA names that match the generated
@@ -467,6 +468,7 @@ class DistributedCompiledProgram:
         self._param_infos = _param_infos
         self._output_indices = _output_indices
         self._return_types = _return_types
+        self._l3_entries = _l3_entries
 
         # Only the fresh-compile path (live IR) writes artifacts. The reload
         # path must not clobber a user's hand-edited debug/run.py or the
@@ -525,6 +527,8 @@ class DistributedCompiledProgram:
             },
         }
         if self._entry_kind == "cluster":
+            from ._cluster_artifacts import host_entries, make_entry_records  # noqa: PLC0415
+
             assert self._cluster_config is not None
             del meta["distributed_config"]
             meta.update(
@@ -533,6 +537,14 @@ class DistributedCompiledProgram:
                 entry_name=self._entry_name,
                 cluster_config=asdict(self._cluster_config),
             )
+            # Identity-only schema-4 records remain useful for inspection. A
+            # generated recursive artifact additionally owns its complete cold
+            # entry ABI; readiness checks require that closure explicitly.
+            if self._program is not None and host_entries(self._program):
+                self._l3_entries = make_entry_records(
+                    self._program, self._cluster_config.node_device_counts()[0]
+                )
+                meta["l3_entries"] = self._l3_entries
         _write_meta_atomically(self._output_dir / _DISTRIBUTED_META_FILENAME, meta)
 
     @classmethod
@@ -602,6 +614,7 @@ class DistributedCompiledProgram:
         raw = meta["raw"]
         entry_kind = "host"
         entry_name = None
+        l3_entries = None
         if raw["schema"] == _CLUSTER_META_SCHEMA:
             known = {
                 "schema",
@@ -620,11 +633,11 @@ class DistributedCompiledProgram:
                     meta_path,
                     f"schema 4 missing cluster metadata fields {sorted(known - set(raw))}",
                 )
-            if set(raw) - known:
+            if set(raw) - known - {"l3_entries"}:
                 raise _meta_error(
                     _DISTRIBUTED_META_FILENAME,
                     meta_path,
-                    f"unknown cluster metadata fields {sorted(set(raw) - known)}",
+                    f"unknown cluster metadata fields {sorted(set(raw) - known - {'l3_entries'})}",
                 )
             if raw.get("entry_kind") != "cluster":
                 raise _meta_error(
@@ -634,6 +647,17 @@ class DistributedCompiledProgram:
             if not isinstance(entry_name, str) or not entry_name.strip():
                 raise _meta_error(_DISTRIBUTED_META_FILENAME, meta_path, "invalid cluster entry_name")
             saved_cluster = _cluster_config_from_dict(raw, meta_path)
+            if "l3_entries" in raw:
+                from ._cluster_artifacts import validate_entry_records  # noqa: PLC0415
+
+                try:
+                    l3_entries = validate_entry_records(
+                        raw["l3_entries"], saved_cluster.node_device_counts()[0]
+                    )
+                except (ValueError, TypeError, KeyError, IndexError) as error:
+                    raise _meta_error(
+                        _DISTRIBUTED_META_FILENAME, meta_path, f"invalid l3_entries: {error}"
+                    ) from error
             if distributed_config is not None:
                 raise ValueError("Cluster metadata cannot use distributed_config")
             if cluster_config is not None:
@@ -641,7 +665,7 @@ class DistributedCompiledProgram:
                     raise ValueError("cluster_config override must match the stored cluster topology/config")
             cluster_config = saved_cluster
             entry_kind = "cluster"
-        elif "cluster_config" in raw or raw.get("entry_kind", "host") != "host":
+        elif "cluster_config" in raw or "l3_entries" in raw or raw.get("entry_kind", "host") != "host":
             raise _meta_error(
                 _DISTRIBUTED_META_FILENAME,
                 meta_path,
@@ -679,6 +703,7 @@ class DistributedCompiledProgram:
             _output_indices=output_indices,
             _return_types=return_types,
             _execution_capabilities=meta["execution_capabilities"],
+            _l3_entries=l3_entries,
         )
 
     @property
@@ -695,6 +720,21 @@ class DistributedCompiledProgram:
     def cluster_config(self) -> ClusterConfig | None:
         """Return an owned copy of the captured launcher snapshot."""
         return replace(self._cluster_config) if self._cluster_config is not None else None
+
+    @property
+    def l3_entries(self) -> dict[str, Any] | None:
+        """Return an owned cold entry closure, or None for identity-only records."""
+        import copy  # noqa: PLC0415
+
+        return copy.deepcopy(self._l3_entries)
+
+    def _require_artifact_ready(self) -> None:
+        """Allow parent-side generation/loading only for complete L4 contracts."""
+        if self._entry_kind == "cluster" and self._l3_entries is None:
+            raise NotImplementedError(
+                "Cluster artifact loading is unsupported without a complete versioned l3_entries closure; "
+                "recompile for recursive artifacts"
+            )
 
     def _require_supported_execution(self) -> None:
         if self._entry_kind == "cluster":

@@ -28,6 +28,46 @@ import torch
 _DISPATCH_PROGRAM_FILE = "dispatch_program.json"
 
 
+def _tensor_from_continuous(arg: Any) -> torch.Tensor:
+    """View an actual mapped SUB argument (or legacy pointer) without copying.
+
+    MappedArg.buffer already begins at its descriptor's byte offset. Keeping
+    this converter in the canonical source lets generated HOST SubWorkers run
+    in an installed package without importing the parent compiler/runtime.
+    """
+    dtype_name = str(arg.dtype).rsplit(".", 1)[-1]
+    if dtype_name.isdecimal():
+        from simpler.task_interface import DataType  # noqa: PLC0415
+
+        dtype_name = DataType(int(dtype_name)).name
+    dtypes = {
+        "FLOAT32": torch.float32,
+        "FLOAT16": torch.float16,
+        "BFLOAT16": torch.bfloat16,
+        "INT8": torch.int8,
+        "INT16": torch.int16,
+        "INT32": torch.int32,
+        "INT64": torch.int64,
+        "UINT8": torch.uint8,
+    }
+    if dtype_name not in dtypes:
+        raise TypeError(f"Unsupported simpler Tensor dtype: {arg.dtype!r}; known dtypes: {sorted(dtypes)}")
+    dtype = dtypes[dtype_name]
+    shapes = tuple(int(extent) for extent in arg.shapes)
+    if hasattr(arg, "buffer"):
+        strides = tuple(int(stride) for stride in arg.strides)
+        span = 1 + sum((extent - 1) * stride for extent, stride in zip(shapes, strides, strict=True))
+        return torch.as_strided(torch.frombuffer(arg.buffer, dtype=dtype, count=span), shapes, strides)
+    if not hasattr(arg, "data"):
+        raise TypeError(
+            f"Expected a simpler MappedArg with .buffer or legacy tensor with .data, got {type(arg).__name__}"
+        )
+    count = math.prod(shapes)
+    size = count * torch.tensor([], dtype=dtype).element_size()
+    backing = (ctypes.c_ubyte * size).from_address(arg.data)
+    return torch.frombuffer(backing, dtype=dtype, count=count).reshape(shapes)
+
+
 class _ChipCallables(dict[str, Any]):
     """Chip callables (or registered handles) with their tensor transfer contracts."""
 

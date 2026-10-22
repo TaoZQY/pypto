@@ -63,10 +63,10 @@ the entry and resolves direct `num_workers()` shape queries and their SSA aliase
 through the existing scalar-definition resolver. HOST loop emission and its
 `_alloc_intermediates(tensors, world_size=1)` ABI remain unchanged.
 
-This CLUSTER support currently exposes internal generated source only. Public L4
-compilation, artifact execution and runners remain gated until recursive entry
-metadata, embedded HOST entries and runner integration are complete. `_io_arg` is
-bound by that future integration; codegen does not import a nonexistent runner.
+CLUSTER_0 supports compilation and parent-side artifact preparation with recursive
+entry metadata and embedded HOST sources. L4 execution remains gated until runner
+integration is complete. `_io_arg` is bound by that future integration; codegen
+does not import a nonexistent runner.
 L4 `world_size` and collective operations remain unsupported. Having a handler
 does not authorize higher levels or calls that skip the adjacent hierarchy level.
 
@@ -226,8 +226,45 @@ reuse that origin after the loop/branch; changing or unresolved origins receive
 a generation diagnostic rather than a new scalar wire value.
 Internal storage must have constant shapes and be prepared before
 initialization; dynamic formal geometry does not authorize dynamic allocation.
-Recursive packaging and actual startup integration also remain
-required. Public L4 compile and execution guards remain in place.
+Recursive source packaging is available for CLUSTER_0. Actual L4 execution
+remains gated until node startup and I/O routing integration is complete.
+
+## Recursive CLUSTER artifacts
+
+CLUSTER_0 compilation emits `orchestration/cluster_orch.py` and one reachable
+HOST subtree at `next_levels/<host>/`. Each HOST uses the unchanged private
+native `(orch, args, config)` entry and owns its reachable CHIP sub-builds at
+`next_levels/<host>/next_levels/<chip>/`, plus its HOST SubWorker sources.
+Shared CHIP function names retain separate full logical registration paths;
+unreachable or stale directory contents do not select additional children.
+Ordinary HOST generation and schema-3 metadata retain their existing format.
+
+Schema-4 `l3_entries` closure version 1 records each entry's relative module and
+qualname, native layout version 1, independent dense tensor/scalar indices,
+omitted distributed-window/final-CommCtx pairs, shapes/directions, prefork
+storage/domain-token requirements, local device count and minimum SubWorkers.
+A separate `view_geometry` version 1 stores window strides and byte offsets;
+the native eight-field window rows are unchanged. Returned tensor copies name
+the canonical helper callable explicitly. Cold restoration validates all fields
+without executing source. Identity-only schema-4 records remain readable but
+cannot become prepared artifacts without their versioned closure.
+
+Parent-side CHIP compilation and prebuilt promotion use the declared full paths.
+`runtime._artifact_sources.build_cluster_source_bundle` returns a SHA-256 digest
+and deterministic gzip-compressed USTAR bytes containing only owned runtime sources, cold metadata
+and a path/size/digest inventory. One canonical neutral helper lives under root
+`orchestration/`; relative HOST package shims re-export it. The enclosing digest
+namespace is supplied during installation and never enters source bytes. The bundle
+is directly accepted by R1 `StartupArtifactSpec` read/install/activation APIs.
+Before parsing source, the producer checks portable paths and bounds each file
+to 64 MiB, the complete unpacked closure to 256 MiB and the member count to 4096
+(including the inventory). Streaming gzip output, including its trailer, is
+bounded to 64 MiB. Windows reserved components and case-folding path aliases
+are rejected on all platforms. Installed
+sources consume registered CHIP handles without PyPTO imports, compiler discovery,
+`kernel_config.py` execution or `ArtifactRuntime.load`. The parent may still use
+those compiler/assembly facilities. L4 execution remains guarded; CLUSTER_1 and
+higher compilation is unsupported.
 
 ## See Also
 

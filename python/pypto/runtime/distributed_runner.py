@@ -30,7 +30,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-import numpy as np
 import torch
 
 from . import _distributed_support
@@ -62,16 +61,7 @@ if TYPE_CHECKING:
 # simpler Tensor → torch.Tensor conversion
 # ---------------------------------------------------------------------------
 
-_DTYPE_MAP: dict[str, tuple[type[ctypes._CData], torch.dtype]] = {
-    "FLOAT32": (ctypes.c_float, torch.float32),
-    "FLOAT16": (ctypes.c_uint8, torch.float16),
-    "BFLOAT16": (ctypes.c_uint8, torch.bfloat16),
-    "INT8": (ctypes.c_int8, torch.int8),
-    "INT16": (ctypes.c_int16, torch.int16),
-    "INT32": (ctypes.c_int32, torch.int32),
-    "INT64": (ctypes.c_int64, torch.int64),
-    "UINT8": (ctypes.c_uint8, torch.uint8),
-}
+_tensor_from_continuous = _distributed_support._tensor_from_continuous
 
 
 def _require_supported_program(compiled: Any) -> None:
@@ -277,67 +267,6 @@ class _RetainedDomainLease:
     def __exit__(self, *_exc: Any) -> bool:
         """Leave the generated scope without releasing the retained handle."""
         return False
-
-
-# Reached only through function-scope lazy imports (pyright's unused analysis
-# discounts cross-module references to private symbols).
-def _tensor_from_continuous(ct: Any) -> torch.Tensor:  # pyright: ignore[reportUnusedFunction]
-    """Convert a mapped wire arg (or legacy chip tensor) to torch, zero-copy.
-
-    Current simpler Python SubWorkers receive ``MappedArg`` objects and expose
-    the view origin through ``arg.buffer``. The explicit ``data`` pointer path
-    is retained narrowly for older/direct chip-tensor callers.
-
-    For dtypes that ``torch.from_numpy`` cannot accept directly (FP16/BF16),
-    we view the buffer as raw bytes (uint8) and reinterpret with
-    ``torch.Tensor.view(dtype)`` — a zero-copy bit-cast that preserves the
-    shared-memory aliasing required for ``Out``/``InOut`` parameters.
-    """
-    # ``str(ct.dtype)`` yields ``"DataType.FLOAT32"``; strip the enum prefix
-    # to match the bare type names used as keys in ``_DTYPE_MAP``.
-    dtype_str = str(ct.dtype)
-    dtype_key = dtype_str.rsplit(".", 1)[-1]
-    if dtype_key.isdecimal():
-        from simpler.task_interface import DataType  # noqa: PLC0415
-
-        dtype_key = DataType(int(dtype_key)).name
-    try:
-        c_type, torch_dtype = _DTYPE_MAP[dtype_key]
-    except KeyError as exc:
-        raise TypeError(
-            f"Unsupported simpler Tensor dtype: {dtype_str!r}. "
-            f"Add an explicit mapping in _DTYPE_MAP. "
-            f"Known dtypes: {sorted(_DTYPE_MAP)}"
-        ) from exc
-
-    n_elements = 1
-    for s in ct.shapes:
-        n_elements *= s
-
-    # Compute the buffer length in units of c_type, then in elements of torch_dtype.
-    element_bytes = ctypes.sizeof(c_type)
-    torch_bytes = torch.tensor([], dtype=torch_dtype).element_size()
-    n_c_elements = n_elements * torch_bytes // element_bytes
-
-    if hasattr(ct, "buffer"):
-        strides = tuple(int(s) for s in ct.strides)
-        shapes = tuple(int(s) for s in ct.shapes)
-        span = 1 + sum((shape - 1) * stride for shape, stride in zip(shapes, strides, strict=True))
-        t = torch.frombuffer(ct.buffer, dtype=torch_dtype, count=span)
-        return torch.as_strided(t, size=shapes, stride=strides)
-    if not hasattr(ct, "data"):
-        raise TypeError(
-            "Expected a simpler MappedArg with .buffer or a legacy chip tensor with .data, "
-            f"got {type(ct).__name__}"
-        )
-
-    arr = np.ctypeslib.as_array(ctypes.cast(ct.data, ctypes.POINTER(c_type)), shape=(n_c_elements,))
-    # torch's stubs leave from_numpy's ndarray item-type parameter unresolved.
-    t = torch.from_numpy(arr)  # pyright: ignore[reportUnknownMemberType]
-    if t.dtype != torch_dtype:
-        # view(dtype) reinterprets the bytes without copying — preserves shared memory.
-        t = t.view(torch_dtype)
-    return t.reshape(ct.shapes)
 
 
 def _load_generated_module(path: Path) -> Any:

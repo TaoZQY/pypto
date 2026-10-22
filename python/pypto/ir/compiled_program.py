@@ -372,7 +372,16 @@ def _load_meta(meta_path: Path, *, filename: str, schema: int | tuple[int, ...])
     except UnicodeDecodeError as exc:  # binary or mis-encoded file
         raise _bad(f"is not valid UTF-8 text ({exc})") from exc
     try:
-        raw_meta: object = json.loads(raw_text)
+
+        def unique_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for name, value in pairs:
+                if name in result:
+                    raise ValueError(f"duplicate metadata field {name!r}")
+                result[name] = value
+            return result
+
+        raw_meta: object = json.loads(raw_text, object_pairs_hook=unique_fields)
     except ValueError as exc:  # JSONDecodeError is a ValueError subclass
         raise _bad(f"not valid JSON ({exc})") from exc
     if not _is_str_dict(raw_meta):

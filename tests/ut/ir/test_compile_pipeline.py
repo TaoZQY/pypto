@@ -305,7 +305,7 @@ def test_c1d1_compile_cluster_distributed_conflict_rejected_before_backend(tmp_p
     assert not (tmp_path / "conflict").exists()
 
 
-def test_c1d1_compile_cluster_config_retains_temporary_pod_guard(tmp_path, monkeypatch):
+def test_c3c_compile_higher_cluster_rejects_before_backend(tmp_path, monkeypatch):
     import importlib  # noqa: PLC0415
 
     from pypto.ir import (  # noqa: PLC0415
@@ -316,12 +316,14 @@ def test_c1d1_compile_cluster_config_retains_temporary_pod_guard(tmp_path, monke
     compile_module = importlib.import_module("pypto.ir.compile")
 
     def no_backend(**kwargs):
-        pytest.fail("Full POD compilation remains unsupported before C3")
+        pytest.fail("Higher cluster compilation must fail before backend discovery")
 
     monkeypatch.setattr(compile_module, "_select_backend", no_backend)
-    with pytest.raises(NotImplementedError, match="(?i)(POD|CLUSTER_0|L4)"):
+    # CLUSTER_0 now uses the real pipeline in test_cluster_artifacts. This
+    # public-API control retains the early gate for undefined higher levels.
+    with pytest.raises(NotImplementedError, match="(?i)(higher|CLUSTER_1|L5)"):
         ir.compile(
-            _c1d1_level_program(ir.Level.CLUSTER_0),
+            _c1d1_level_program(ir.Level.CLUSTER_1),
             output_dir=str(tmp_path / "pod"),
             cluster_config=ClusterConfig([ClusterNodeSpec("node-a")], "/env/bin/python"),
         )

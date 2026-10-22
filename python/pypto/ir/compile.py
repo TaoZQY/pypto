@@ -79,11 +79,11 @@ def _highest_orchestration_level(program: _ir_core.Program) -> _ir_core.Level | 
 
 
 def _check_supported_orchestration_level(level: _ir_core.Level | None) -> None:
-    """Reject full L4 compilation until cluster codegen and its runner exist."""
-    if level is not None and _ir_core.level_to_linqu_level(level) >= 4:
+    """Compile CLUSTER_0 artifacts; higher cluster levels have no defined contract."""
+    if level is not None and _ir_core.level_to_linqu_level(level) > 4:
         raise NotImplementedError(
-            f"POD/CLUSTER_0 (L4) and higher orchestration compilation is not supported yet "
-            f"(received {level.name}): cluster codegen and runner integration are not implemented. "
+            f"Higher cluster orchestration compilation is not supported "
+            f"(received {level.name}): only POD/CLUSTER_0 (L4) artifacts are defined. "
             "Specialization, parsing and serialization remain available."
         )
 
@@ -436,8 +436,8 @@ def compile(  # noqa: PLR0913
             ``DistributedConfig()`` is used.
         cluster_config: Optional :class:`ClusterConfig` for POD/CLUSTER_0
             orchestration. Cannot be combined with ``distributed_config`` or
-            supplied for HOST/CHIP programs. Full POD compilation remains
-            unsupported until cluster codegen and runner integration exist.
+            supplied for HOST/CHIP programs. CLUSTER_0 compilation creates
+            recursive artifacts; execution remains gated until runner integration.
         analyze_auto_scopes_for_deps: If True, let
             ``AutoDeriveTaskDependencies`` analyze AUTO runtime scopes. The
             default is False to preserve the existing TensorMap-fallback

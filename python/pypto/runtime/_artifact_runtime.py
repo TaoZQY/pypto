@@ -64,9 +64,7 @@ class ArtifactRuntime:
             handle = self.handle
             manifest = self._validate()
             if handle.spec.entry_kind == "cluster":
-                raise NotImplementedError(
-                    "Cluster/POD (L4) compilation/loading is unsupported until cluster runner integration"
-                )
+                _restore_program_metadata(handle)._require_artifact_ready()
             if handle.spec.state is ArtifactState.GENERATED:
                 spec = ready_spec(handle.directory, handle.spec)
 
