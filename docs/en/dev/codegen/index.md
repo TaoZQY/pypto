@@ -48,8 +48,10 @@ allocation accepts `_domain_provider` and `retain_after_run=_retain`; CHIP order
 tokens remain specific to HOST. All tensors precede scalars, preserving each
 pool's formal order, explicit Submit dependencies, TaskId results and output aliases.
 Implicit tensor return storage also uses the node routing binding with
-`OUTPUT_EXISTING`; this is a packing contract, while the embedded HOST return ABI
-is still pending. Same-level CLUSTER SubWorker dispatch is rejected explicitly.
+`OUTPUT_EXISTING`. Caller packing and embedded HOST returns share a return-position
+plan: an actual returned Out/InOut aliases its supplied storage; every other
+ordinary tensor return has a separate output slot. Same-level CLUSTER SubWorker
+dispatch is rejected explicitly.
 
 CLUSTER `for` loops bind SSA carries before the loop, update them in parallel at
 the backedge, and expose final values after the loop, including zero-trip loops.
@@ -67,6 +69,165 @@ metadata, embedded HOST entries and runner integration are complete. `_io_arg` i
 bound by that future integration; codegen does not import a nonexistent runner.
 L4 `world_size` and collective operations remain unsupported. Having a handler
 does not authorize higher levels or calls that skip the adjacent hierarchy level.
+
+## Private embedded HOST source API
+
+The explicit internal call
+`DistributedCodegen()._generate_embedded(program, entry_name="node")` emits the
+selected HOST Orchestrator's real dispatch body as `def node(orch, args, config)`.
+It shares the native emitter with ordinary `generate()`; merely including a HOST
+function never changes the ordinary entry-selection rule or ABI. Omitting
+`entry_name` requires exactly one HOST Orchestrator, even when the program also
+contains a CLUSTER root. Unknown names, other levels and SubWorkers are rejected.
+
+Pass the complete lowered Program. Native precondition verification still checks
+the complete hierarchy, including CLUSTER scopes that own a selected HOST body's
+window parameters; constructing a detached HOST fragment loses that ownership.
+
+The actual entry requires `node._pypto_embedded_state` to be bound after module
+import and before accepting a task. Reserved module aliases keep this lookup
+valid when the entry's name matches an ABI parameter or Python builtin.
+Its `begin_invocation(orch, args, config)` method supplies a frame with tensor
+bindings and a keepalive collection. The
+state also supplies registered CHIP callables, SubWorker IDs, local device count
+and the domain provider. The frame must survive the Python body's return until
+its submitted DAG completes.
+
+`node._pypto_embedded_layout` is an immutable mapping with `version=1` and tuple
+fields `tensor_slots`, `scalar_slots`, `window_slots`, `implicit_outputs` and
+`prefork_requirements`. Tensor records are
+`(formal_position, ssa_name, tensor_index, dtype, direction, shape)`; scalar records
+are `(formal_position, ssa_name, scalar_index, dtype)`. The two wire pools have
+independent dense indexes. Directions use `In`, `Out` and `InOut`; explicit output
+descriptors remain caller supplied.
+
+DistributedTensor formals consume no tensor slot. Their `window_slots` records
+are `(formal_position, ssa_name, ctx_formal_position, ctx_scalar_index, window_name,
+dtype, direction, shape)`. Pairing uses strict DT formal order and only the final
+N CommCtx formals added by context materialization. Earlier CommCtx parameters
+remain in their original scalar order with dtype `comm_ctx`; names do not choose
+the pairs. Native WindowBuffer pointer identity chooses the generated binding.
+
+All received CommCtx values are global domain IDs. Before dispatch, state resolves
+each unique ID with `orch.get_global_domain`, checks its committed generation,
+required local worker contexts and named window slots, and binds the real view.
+Materialization uses `view[local_worker_id].buffers[name].tensor(...)`; forwarded
+contexts use that worker's `device_ctx`, and builtin rank counts use its
+`domain_size`. Local worker IDs, global ranks and domain sizes are independent.
+
+Implicit output records are `(return_position, tensor_index, dtype, shape)` and
+follow all ordinary tensor formals, before the independent scalar pool. A returned
+input or internal result never replaces its input binding: the entry schedules
+`_copy_return_tensor` as a registered CPU SubWorker with source `INPUT` and
+destination `OUTPUT_EXISTING`. The native runtime infers dependencies on pending
+CHIP/SUB producers from their canonical buffer identities. The copy consumes real
+mapped views, validates matching dtype/shape, direct load/store rights, bounds,
+alignment and destination strides, and preserves offsets and padding. Flat
+multi-tensor returns retain per-position aliases and Submit's final TaskId.
+Consuming scalar returns has an explicit unsupported-transport diagnostic; unused
+scalar returns remain permitted.
+
+The cached plan reads `ExplicitReturnedParamIndices` for the actual
+`NormalizeReturnOrder`/`ReturnParamsExplicit` domain (InCore/AIC/AIV, Group/Spmd,
+Graph). Those passes exclude hierarchy Opaque and Orchestration functions; only
+those excluded functions use the existing general SSA return-lineage resolver.
+When a function has no return annotation, the same cached plan derives one type
+per terminal return operand, matching call-type inference without changing its
+declared signature or flattening a packed tuple.
+
+The relative `_distributed_support.py` closure owns tensor conversion, CHIP
+dispatch/DFX and `_EmbeddedEntryState`. It imports no PyPTO/compiler modules.
+Standalone generated HOST imports remain compatible through parent aliases and
+a thin DeviceTensor provenance wrapper. Signed scalar widths, BOOL, INDEX and
+FP32 decode from real uint64 slots. The neutral scalar helpers additionally
+preserve FP64 via `ctypes.c_double`; PyPTO currently exposes no FP64 formal.
+
+State checks both argument counts before binding, resets CHIP placement and DFX
+per invocation, and refuses reuse until `complete_invocation()` is called after
+the corresponding runtime DAG drains. `close()` retires state after worker
+shutdown. These methods allocate Python metadata only; storage must be prepared
+before the inner fork.
+
+Entries with implicit outputs declare `("return_copy_subworker", 1)` in
+`prefork_requirements`. Startup must provide at least one CPU SubWorker, register
+the canonical copy callable before initialization, and bind its handle through
+`return_copy_callable`. Constant internal storage is declared as
+`("tensor_storage", ssa_name, dtype, shape)`. State construction checks every
+required prepared value is either shared CPU Torch storage or a real HOST
+descriptor with the declared dtype/shape. It allocates no tensor storage. Outgoing
+CHIP and copy TaskArgs remain in the same invocation frame until explicit DAG
+completion; returning from the Python entry does not retire them.
+
+`_EmbeddedNodeState(local_worker_ids=..., prepared_domain_tokens=...)` supplies
+fixed shared CPU int32[1] token bundles before the inner fork. Bind the same node
+state to all entries through `node_state`. A canonical `(domain_id, generation)`
+lease shares one worker-specific token across aliases, windows, explicit ctx-only
+dispatches and entries. Both custom and builtin dispatch append deduplicated
+INOUT tokens in argument-first-reference order, before every scalar. Builtin
+window arguments must agree on a physical domain.
+
+The `inherited_domain_tokens` requirement declares the maximum distinct incoming
+ctx count; acquisition checks the actual deduplicated keys against prepared
+capacity. `domain_dispatch` records required worker IDs (a dynamic selector
+requires coverage of the full local topology), and `same_domain` records alias
+or builtin agreement checks. All decoding, view/context/slot checks and capacity
+preflight precede frame/lease publication. Failed preflight leaves the state
+retryable. Completion releases active frame references; explicit
+`retire_domain(id, generation)` returns a completed lease's slot for reassignment
+and refuses while any entry frame still uses it. `close()` requires drained
+leases and releases the bounded storage references.
+
+HOST-owned domains retain their existing allocation provider/context manager.
+Their separate `local_domain_tokens` requirement names prepared worker-indexed
+tokens; it does not assume global ID/generation fields on a local handle. No
+invocation path allocates or shares token storage. Startup, global import/commit
+and physical-domain lifetime integration remain runner work. Already-lowered
+inherited builtin source is supported here; public inherited HOST collective
+lowering remains a separate optional extension. Existing local HOST public
+collective lowering is unchanged.
+
+Ordinary tensor formal shapes retain integer dimensions in layout v1. A dynamic
+dimension is `("var", canonical_name)` or
+`("mul", ("var", canonical_name), positive_integer)`; other expressions are
+rejected. These immutable opcode tuples contain no IR objects or executable
+strings. C3c must persist and strictly validate them. Before publishing a frame,
+state checks received dtype, rank, fixed axes, exact multiplication divisibility
+and consistent variable values across every formal. Generated dynamic bindings
+read native descriptor `.shapes`.
+
+Embedded ordinary tensor slices compose byte offsets and element strides over
+the original BufferDescriptor, including unit-axis rank reduction. Contiguous,
+product-preserving ND `tensor.view`/`tensor.reshape` preserve the same backing,
+offset and dtype; noncontiguous reinterpretation, partial validity and padding
+are rejected. Native Tensor construction checks descriptor bounds. No view
+allocates or maps storage. Embedded `tensor.assemble` writes are unsupported and
+rejected during generation. Already-lowered distributed-window formals preserve
+full-valid ND element strides and constant byte offsets. A nonempty MemRef must
+identify the exact owning WindowBuffer base. The sole normalization for a
+function-local origin is a constant-zero, static dense full-valid ND view whose
+overflow-checked logical storage bytes equal both the named slot size and the
+MemRef size; other unknown origins are rejected. The offset is emitted once relative to the named Buffer's
+slot origin, with no element-size multiplication or additional physical-slot
+offset. Native Tensor construction retains descriptor provenance and checks
+bounds. Public DT Slice and shape-view operations with unresolved slot geometry
+give an early generation diagnostic. DT/ctx-only tuples, aliases and projections
+remain IR metadata. CommCtx projections follow actual tuple definitions and
+aliases back to the exact received formal or window query, with no new scalar
+wire value. Their producer calls and Submit TaskId/dependencies
+still execute; they create no Python tensor slots or returned ctx wire values.
+Embedded `For` carries read their live SSA values, apply backedges in parallel
+and expose initial values after zero iterations. Nested loops initialize from
+the live outer carry. DT/ctx metadata keeps its original yield/phi positions
+without Python tensor slots; metadata-only `For` and `If` suites remain valid.
+Before dispatch/layout emission, CommCtx carries must prove the same exact
+received formal or owned-window query origin at initialization and every
+backedge. Context phis require that origin on both branches. Stable results
+reuse that origin after the loop/branch; changing or unresolved origins receive
+a generation diagnostic rather than a new scalar wire value.
+Internal storage must have constant shapes and be prepared before
+initialization; dynamic formal geometry does not authorize dynamic allocation.
+Recursive packaging and actual startup integration also remain
+required. Public L4 compile and execution guards remain in place.
 
 ## See Also
 
