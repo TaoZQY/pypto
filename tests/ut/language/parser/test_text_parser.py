@@ -9,14 +9,15 @@
 
 """Unit tests for pl.parse() and pl.loads() text parsing functions."""
 
+import ast
 import os
 import tempfile
 
 import pypto
 import pypto.language as pl
 import pytest
-from pypto import ir
-from pypto.language.parser.diagnostics import ParserError
+from pypto import ir, passes
+from pypto.language.parser.diagnostics import ParserError, ParserTypeError
 from pypto.language.parser.diagnostics.renderer import ErrorRenderer
 
 
@@ -911,6 +912,402 @@ def main(x: pl.Tensor[[{extent}, 16], pl.FP32]):
     printed = ir.python_print(before)
     assert "view: pl.Tensor[[pl.tensor.dim(" in printed
     ir.assert_structural_equal(before, pl.parse('N = pl.dynamic("N")\n' + printed))
+
+
+def _window_identity_source(order=("chip", "host", "owner"), *, key='"shared"', size="size"):
+    """Build explicit dump text without depending on the materialization pass.
+
+    The inherited types deliberately retain different local layouts/storage.
+    The owner descriptor alone binds its base and dynamic byte size.
+    """
+    child_type = (
+        "pld.DistributedTensor[[2, 3], pl.FP16, "
+        "pl.TensorView(stride=[1, 2], layout=pl.TensorLayout.ND), "
+        f'pl.MemRef("buf", 8, 12), pl._dump.window_ref({key})]'
+    )
+    owner_type = f"pld.DistributedTensor[[4], pl.FP32, pl._dump.window_ref({key})]"
+    methods = {}
+    for name, level in (("chip", "CHIP"), ("host", "HOST")):
+        methods[name] = f"""
+    @pl.function(level=pl.Level.{level}, role=pl.Role.Orchestrator)
+    def {name}(self, x: {child_type}, n: pl.Scalar[pl.INDEX]) -> {child_type}:
+        size = n * 8
+        return x
+"""
+    methods["owner"] = f"""
+    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+    def owner(self, n: pl.Scalar[pl.INDEX]):
+        with pl._dump.comm_domain(name="global", devices=[], slots=[
+            pl._dump.window_buffer({key}, base="buf", size={size},
+                                   load_from_host=True, store_to_host=True)
+        ]):
+            size = n * 4
+            buf = pld.alloc_window_buffer(size)
+            data: {owner_type} = pld.window(buf, [4], dtype=pl.FP32)
+            return data
+"""
+    return "@pl.program\nclass ExplicitWindowIdentity:\n" + "\n".join(methods[name] for name in order)
+
+
+def _window_function(program, name):
+    return program.functions[program.get_global_var(name)]
+
+
+def _window_statements(stmt):
+    yield stmt
+    if isinstance(stmt, ir.SeqStmts):
+        for child in stmt.stmts:
+            yield from _window_statements(child)
+    elif isinstance(stmt, ir.ScopeStmt):
+        yield from _window_statements(stmt.body)
+
+
+def _window_owner(program):
+    owner = _window_function(program, "owner")
+    scope = next(s for s in _window_statements(owner.body) if isinstance(s, ir.CommDomainScopeStmt))
+    return owner, scope, scope.slots[0]
+
+
+@pytest.mark.parametrize(
+    "order", [("chip", "host", "owner"), ("owner", "host", "chip"), ("host", "owner", "chip")]
+)
+@pytest.mark.parametrize("key", ['"shared"', "7"])
+def test_program_window_identity_across_function_order(order, key):
+    """Forward references and three levels share only the explicit window ID."""
+    program = pl.parse_program(_window_identity_source(order, key=key))
+    _, scope, slot = _window_owner(program)
+    assert slot.load_from_host is True
+    assert slot.store_to_host is True
+    for name in ("chip", "host"):
+        func = _window_function(program, name)
+        assert func.params[0].type.window_buffer is slot
+        assert func.return_types[0].window_buffer is slot
+        returned = next(s for s in _window_statements(func.body) if isinstance(s, ir.ReturnStmt))
+        assert returned.value[0] is func.params[0]
+        assert returned.value[0].type.window_buffer is slot
+        assert not any(isinstance(s, ir.CommDomainScopeStmt) for s in _window_statements(func.body))
+    data = next(
+        s
+        for s in _window_statements(scope.body)
+        if isinstance(s, ir.AssignStmt) and s.var.name_hint == "data"
+    )
+    assert data.var.type.window_buffer is slot
+
+
+@pytest.mark.parametrize("size", ["size", "n * 4"])
+def test_program_window_identity_uses_owner_local_base_and_dynamic_size(size):
+    """A child's same-spelling locals must never resolve owner metadata."""
+    program = pl.parse_program(_window_identity_source(size=size))
+    owner, scope, slot = _window_owner(program)
+    assignments = {s.var.name_hint: s for s in _window_statements(scope.body) if isinstance(s, ir.AssignStmt)}
+    assert slot.base is assignments["buf"].var
+    assert assignments["buf"].value.args[0] is assignments["size"].var
+    owner_size = assignments["size"].value
+    assert isinstance(owner_size, ir.Mul)
+    assert owner_size.left is owner.params[0]
+    assert owner_size.right.value == 4
+    if size == "size":
+        assert slot.size is assignments["size"].var
+    else:
+        assert isinstance(slot.size, ir.Mul)
+        assert slot.size.left is owner.params[0]
+        assert slot.size.right.value == 4
+    for name in ("chip", "host"):
+        child = _window_function(program, name)
+        assert child.params[1] is not owner.params[0]
+        child_size = next(s.var for s in _window_statements(child.body) if isinstance(s, ir.AssignStmt))
+        assert slot.size is not child_size
+
+
+def test_program_window_identity_preserves_function_local_storage_and_views():
+    """Identical base names grant no cross-function MemRef allocation identity."""
+    program = pl.parse_program(_window_identity_source())
+    _, _, slot = _window_owner(program)
+    child_types = [_window_function(program, name).params[0].type for name in ("chip", "host")]
+    for ty in child_types:
+        assert ty.window_buffer is slot
+        assert [dim.value for dim in ty.shape] == [2, 3]
+        assert ty.dtype == pl.FP16
+        assert ty.memref.byte_offset_.value == 8
+        assert ty.memref.size_ == 12
+        assert ty.memref.base_.name_hint == "buf"
+        assert ty.memref.base_ is not slot.base
+        assert [stride.value for stride in ty.tensor_view.stride] == [1, 2]
+        assert ty.tensor_view.layout == ir.TensorLayout.ND
+    assert child_types[0].memref is not child_types[1].memref
+    assert child_types[0].memref.base_ is not child_types[1].memref.base_
+
+
+@pytest.mark.parametrize("kind", ["call", "submit"])
+def test_program_window_identity_rebinds_call_submit_and_result_types(kind):
+    """Deferred windows in signatures also reach launch results and projections."""
+    ty = 'pld.DistributedTensor[[4], pl.FP32, pl._dump.window_ref("shared")]'
+    dispatch = (
+        "result = self.chip(x, worker=0)"
+        if kind == "call"
+        else "result, tid = pl.submit(self.chip, x, worker=0, deps=[dep])"
+    )
+    source = f"""
+@pl.program
+class WindowLaunch:
+    @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+    def chip(self, x: {ty}) -> {ty}:
+        return x
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def host(self, x: {ty}, dep: pl.Scalar[pl.TASK_ID]) -> {ty}:
+        with pl.manual_scope():
+            {dispatch}
+        return result
+    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+    def owner(self):
+        with pl._dump.comm_domain(name="global", devices=[], slots=[
+            pl._dump.window_buffer("shared", base="buf", size=16)
+        ]):
+            buf = pld.alloc_window_buffer(16)
+            data: {ty} = pld.window(buf, [4], dtype=pl.FP32)
+            return data
+"""
+    program = pl.parse_program(source)
+    _, _, slot = _window_owner(program)
+    host = _window_function(program, "host")
+    assignments = [s for s in _window_statements(host.body) if isinstance(s, ir.AssignStmt)]
+    launch = next(s.value for s in assignments if isinstance(s.value, (ir.Call, ir.Submit)))
+    assert launch.args[0] is host.params[0]
+    assert launch.args[0].type.window_buffer is slot
+    assert host.return_types[0].window_buffer is slot
+    if kind == "call":
+        assert launch.type.window_buffer is slot
+    else:
+        assert isinstance(launch, ir.Submit)
+        assert launch.type.types[0].window_buffer is slot
+        assert launch.type.types[1].dtype == pl.TASK_ID
+        assert len(launch.deps) == 1 and launch.deps[0] is host.params[1]
+        projection = next(s for s in assignments if isinstance(s.value, ir.TupleGetItemExpr))
+        assert projection.var.type.window_buffer is slot
+        assert projection.value.type.window_buffer is slot
+    returned = next(s for s in _window_statements(host.body) if isinstance(s, ir.ReturnStmt))
+    assert returned.value[0].type.window_buffer is slot
+
+
+def test_program_window_identity_rejects_unknown_id():
+    source = _window_identity_source().replace(
+        'pl._dump.window_ref("shared")', 'pl._dump.window_ref("missing")'
+    )
+    with pytest.raises(ParserTypeError, match="Undefined window_buffer ID.*missing"):
+        pl.parse_program(source)
+
+
+def test_program_window_identity_rejects_conflicting_cross_function_descriptors():
+    source = """
+@pl.program
+class ConflictingWindows:
+    @pl.function
+    def first(self, x: pld.DistributedTensor[[4], pl.FP32,
+        pl._dump.window_buffer("shared", base="first_buf", size=16)]):
+        return x
+    @pl.function
+    def second(self, x: pld.DistributedTensor[[4], pl.FP32,
+        pl._dump.window_buffer("shared", base="second_buf", size=32)]):
+        return x
+"""
+    with pytest.raises(ParserTypeError, match="Conflicting window_buffer descriptors.*shared"):
+        pl.parse_program(source)
+
+
+def test_program_window_identity_does_not_leak_between_parses():
+    first = pl.parse_program(_window_identity_source())
+    second = pl.parse_program(_window_identity_source())
+    _, _, first_slot = _window_owner(first)
+    _, _, second_slot = _window_owner(second)
+    assert first_slot is not second_slot
+    assert first_slot.base is not second_slot.base
+    assert _window_function(first, "chip").params[0].type.window_buffer is first_slot
+    assert _window_function(second, "chip").params[0].type.window_buffer is second_slot
+    # A successful previous parse cannot supply a missing owner to this one.
+    source = """
+@pl.program
+class MissingOwner:
+    @pl.function
+    def child(self, x: pld.DistributedTensor[[4], pl.FP32, pl._dump.window_ref("shared")]):
+        return x
+"""
+    with pytest.raises(ParserTypeError, match="Undefined window_buffer ID.*shared"):
+        pl.parse_program(source)
+
+
+@pytest.mark.parametrize("level", ["HOST", "CLUSTER_0"])
+def test_program_window_identity_ignores_opaque_subworker_body(level):
+    """Private dump spellings inside callback Python are opaque source text."""
+    source = (
+        _window_identity_source(("owner",))
+        + f"""
+    @pl.function(level=pl.Level.{level}, role=pl.Role.SubWorker)
+    def callback(value: pl.Scalar[pl.INT64]):
+        ignored = pl._dump.window_buffer("shared", base="not_ir", size=123)
+        other = pl._dump.window_buffer("shared", base="also_not_ir", size=456)
+        return {{"value": value, "ignored": ignored, "other": other}}
+"""
+    )
+    program = pl.parse_program(source)
+    _, _, slot = _window_owner(program)
+    assert slot.base.name_hint == "buf"
+    callback = _window_function(program, "callback")
+    inline = next(s for s in _window_statements(callback.body) if isinstance(s, ir.InlineStmt))
+    expected_body = "\n".join(
+        [
+            'ignored = pl._dump.window_buffer("shared", base="not_ir", size=123)',
+            'other = pl._dump.window_buffer("shared", base="also_not_ir", size=456)',
+            'return {"value": value, "ignored": ignored, "other": other}',
+        ]
+    )
+    # Source capture uses ast.unparse, whose quote choice is not semantic.
+    # Compare all callback statements, literal fields and the return payload.
+    assert ast.dump(ast.parse(inline.body)) == ast.dump(ast.parse(expected_body))
+
+
+def _window_owner_size_query_source(*, owner_first):
+    ty_a = 'pld.DistributedTensor[[4], pl.FP32, pl._dump.window_ref("window_a")]'
+    ty_b = 'pld.DistributedTensor[[4], pl.FP32, pl._dump.window_ref("window_b")]'
+    size = "pld.system.rank(pld.system.get_comm_ctx(x)) + 16"
+    methods = {
+        "child": f"""
+    @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+    def a_child(self, y: {ty_b}) -> {ty_b}:
+        return y
+""",
+        "owner_b": f"""
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def m_owner_b(self, x: {ty_a}):
+        with pl._dump.comm_domain(name="local", devices=[], slots=[
+            pl._dump.window_buffer("window_b", base="b_buf", size={size})
+        ]):
+            b_buf = pld.alloc_window_buffer({size})
+            y: {ty_b} = pld.window(b_buf, [4], dtype=pl.FP32)
+""",
+        "owner_a": f"""
+    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+    def z_owner_a(self):
+        with pl._dump.comm_domain(name="global", devices=[], slots=[
+            pl._dump.window_buffer("window_a", base="a_buf", size=16)
+        ]):
+            a_buf = pld.alloc_window_buffer(16)
+            x: {ty_a} = pld.window(a_buf, [4], dtype=pl.FP32)
+""",
+    }
+    order = ("owner_a", "owner_b", "child") if owner_first else ("child", "owner_b", "owner_a")
+    return "@pl.program\nclass OwnerSizeQuery:\n" + "\n".join(methods[name] for name in order)
+
+
+def _window_size_query_ctx(expr):
+    assert isinstance(expr, ir.Add)
+    promoted = expr.left
+    assert isinstance(promoted, ir.Cast) and promoted.type.dtype == pl.INDEX
+    rank = promoted.operand
+    assert isinstance(rank, ir.Call) and rank.op.name == ir.get_op("pld.system.rank").name
+    assert rank.type.dtype == pl.INT32
+    ctx = rank.args[0]
+    assert isinstance(ctx, ir.Call) and ctx.op.name == ir.get_op("pld.system.get_comm_ctx").name
+    return ctx
+
+
+@pytest.mark.parametrize("owner_first", [True, False])
+def test_program_window_identity_owner_size_query_keeps_rebound_parameter(owner_first):
+    """A local owner's size query must bind its rewritten inherited formal."""
+    program = pl.parse_program(_window_owner_size_query_source(owner_first=owner_first))
+    owner_a = _window_function(program, "z_owner_a")
+    owner_b = _window_function(program, "m_owner_b")
+    scope_a = next(s for s in _window_statements(owner_a.body) if isinstance(s, ir.CommDomainScopeStmt))
+    scope_b = next(s for s in _window_statements(owner_b.body) if isinstance(s, ir.CommDomainScopeStmt))
+    slot_a, slot_b = scope_a.slots[0], scope_b.slots[0]
+    assert owner_b.params[0].type.window_buffer is slot_a
+    assert _window_function(program, "a_child").params[0].type.window_buffer is slot_b
+    allocation = next(
+        s
+        for s in _window_statements(scope_b.body)
+        if isinstance(s, ir.AssignStmt) and s.var.name_hint == "b_buf"
+    )
+    assert slot_b.base is allocation.var
+    # Both queries are legal HOST scalar expressions. Verify the complete
+    # source premise before distinguishing metadata and body def-use identity.
+    properties = passes.IRPropertySet()
+    for prop in (passes.IRProperty.TypeChecked, passes.IRProperty.AssignTypeSymmetry):
+        properties.insert(prop)
+    assert passes.PropertyVerifierRegistry.verify(properties, program) == []
+
+    ctx = _window_size_query_ctx(slot_b.size)
+    alloc_ctx = _window_size_query_ctx(allocation.value.args[0])
+    assert alloc_ctx.args[0] is owner_b.params[0]
+    assert ctx.args[0] is owner_b.params[0]
+
+
+def test_program_window_identity_manual_descriptor_size_rebinds_without_own_placeholder():
+    """An eager manual descriptor still depends on its owner's rewritten Var.
+
+    B has no owning scope and defines its full descriptor in the return
+    annotation after x binds. Therefore B is already actual, never a registry
+    placeholder, when the later child signature refers to it. A remains forward.
+    """
+    ty_a = 'pld.DistributedTensor[[4], pl.FP32, pl._dump.window_ref("window_a")]'
+    size = "pld.system.rank(pld.system.get_comm_ctx(x)) + 16"
+    ty_b = (
+        f'pld.DistributedTensor[[4], pl.FP32, pl._dump.window_buffer("window_b", base="b_buf", size={size})]'
+    )
+    ref_b = 'pld.DistributedTensor[[4], pl.FP32, pl._dump.window_ref("window_b")]'
+    source = f"""
+@pl.program
+class ManualOwnerSizeQuery:
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def m_owner_b(self, x: {ty_a}) -> {ty_b}:
+        b_buf = pld.alloc_window_buffer({size})
+        y: {ty_b} = pld.window(b_buf, [4], dtype=pl.FP32)
+        return y
+    @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+    def a_child(self, y: {ref_b}) -> {ref_b}:
+        return y
+    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+    def z_owner_a(self):
+        with pl._dump.comm_domain(name="global", devices=[], slots=[
+            pl._dump.window_buffer("window_a", base="a_buf", size=16)
+        ]):
+            a_buf = pld.alloc_window_buffer(16)
+            x: {ty_a} = pld.window(a_buf, [4], dtype=pl.FP32)
+"""
+    program = pl.parse_program(source)
+    owner = _window_function(program, "m_owner_b")
+    slot_b = owner.return_types[0].window_buffer
+    assert _window_function(program, "a_child").params[0].type.window_buffer is slot_b
+    assert not any(isinstance(s, ir.CommDomainScopeStmt) for s in _window_statements(owner.body))
+    assignments = {s.var.name_hint: s for s in _window_statements(owner.body) if isinstance(s, ir.AssignStmt)}
+    assert assignments["y"].var.type.window_buffer is slot_b
+    assert slot_b.base is assignments["b_buf"].var
+    properties = passes.IRPropertySet()
+    for prop in (passes.IRProperty.TypeChecked, passes.IRProperty.AssignTypeSymmetry):
+        properties.insert(prop)
+    assert passes.PropertyVerifierRegistry.verify(properties, program) == []
+    alloc_ctx = _window_size_query_ctx(assignments["b_buf"].value.args[0])
+    assert alloc_ctx.args[0] is owner.params[0]
+    assert _window_size_query_ctx(slot_b.size).args[0] is owner.params[0]
+
+
+def test_standalone_window_identity_preserves_full_descriptor_annotations():
+    """The program registry must not change the standalone annotation surface."""
+    source = """
+@pl.function
+def standalone(x: pld.DistributedTensor[[4], pl.FP32,
+    pl._dump.window_buffer(7, base="buf", size=16, load_from_host=True)]
+) -> pld.DistributedTensor[[4], pl.FP32, pl._dump.window_ref(7)]:
+    return x
+"""
+    func = pl.parse(source)
+    assert isinstance(func, ir.Function)
+    slot = func.params[0].type.window_buffer
+    assert slot is func.return_types[0].window_buffer
+    assert slot.base.name_hint == "buf"
+    assert slot.size.value == 16
+    assert slot.load_from_host is True
+    assert slot.store_to_host is False
+    returned = next(s for s in _window_statements(func.body) if isinstance(s, ir.ReturnStmt))
+    assert returned.value[0] is func.params[0]
 
 
 if __name__ == "__main__":

@@ -122,6 +122,32 @@ syntax, not new kernel authoring APIs:
 | `pl._dump.logical_xor(x, y)` | BOOL `Xor`; `x ^ y` instead denotes integer `BitXor` |
 | `pl.const(pl._dump.float64("7ff0000000000000"), pl.FP32)` | Positive infinity with explicit dtype |
 | `pl._dump.WindowBuffer`, `pl._dump.Unknown` | Internal fieldless type markers |
+| `pl._dump.window_buffer(key, base=..., size=...)` | Full window descriptor, including optional host staging flags |
+| `pl._dump.window_ref(key)` | Reference to the same window object by explicit string or numeric ID |
+
+Window IDs are local to one program parse. A descriptor in an owning
+`pl._dump.comm_domain(..., slots=[...])` scope can be referenced by function
+parameters, bodies, declared results, and Call/Submit result types throughout
+the program, regardless of function order. The parser resolves the descriptor
+after its owning scope's body, using that function's real allocation and local
+size expressions, including `size = n * 4`. Referencing functions retain their
+own shape, dtype, MemRef, and tensor view; matching storage names alone never
+share allocations across functions. Unknown, conflicting, or unresolved IDs
+raise parser errors before the program is returned.
+
+Full descriptors in manual annotations and standalone function parsing remain
+supported. HOST/CLUSTER SubWorker Python bodies stay opaque; descriptor-like
+Python calls inside them do not define IR windows. Their signatures are still
+parsed as IR metadata.
+
+Deferred window references are replaced in one final native mutator traversal.
+The parser's private helper explicitly replaces distributed type back-references;
+the ordinary `IRMutator` type walk preserves those references and does not
+traverse cross-function owner metadata through them.
+The private helper also rebinds descriptor size expressions through the actual
+owner Var identities, including inherited tensors used by scalar context queries.
+All type references and owning slots share the resulting canonical window.
+Cyclic replacement chains or window-size dependencies raise a diagnostic.
 
 `pl.Ptr` continues to represent `PtrType`, including in signatures. Marker
 round-tripping does not establish that an arbitrary internal signature can be

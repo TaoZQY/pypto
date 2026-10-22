@@ -53,6 +53,15 @@ item expressions. Other open references retain free-variable semantics.
 Program functions have independent contexts; program map keys and callee names
 remain significant.
 
+For a Program, explicit `CommDomainScopeStmt` slots also establish window owner
+identities. A cross-function window reference identifies its owning function map
+key, scope position, and slot position. The owner still compares every storage
+field using its own local bindings, including symbolic size expressions and host
+staging flags. This preserves window sharing across functions without importing
+the owner's ordinary variables or MemRef namespace. Multiple owning slots for
+the same window are unsupported because their reference identity is ambiguous.
+Standalone functions and unowned resources retain their existing comparison rules.
+
 ## Storage and Partial IR
 
 `MemRef`, `WindowBuffer`, pointer/resource marker types, and attached storage are

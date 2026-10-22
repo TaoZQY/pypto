@@ -725,7 +725,29 @@ def test_device_get_comm_ctx_is_replaced_by_materialized_context():
             pld.system.wait(data, offsets=[0], expected=1, cmp=pld.WaitCmp.Eq)
 
     result = _apply(Before)
-    ir.assert_structural_equal(_get_func(result, "chip_orch"), _get_func(ExpectedChipOrch, "chip_orch"))
+    chip = _get_func(result, "chip_orch")
+    expected_chip = _get_func(ExpectedChipOrch, "chip_orch")
+    old_data = expected_chip.params[0]
+    old_type = old_data.type
+    window = chip.params[0].type.window_buffer
+    assert window is not None
+    expected_data = ir.Var(
+        old_data.name_hint,
+        ir.DistributedTensorType(
+            list(old_type.shape), old_type.dtype, old_type.memref, old_type.tensor_view, window
+        ),
+        old_data.span,
+    )
+
+    class BindExpectedWindow(ir.IRMutator):
+        def visit_var(self, var):
+            return expected_data if var is old_data else super().visit_var(var)
+
+    # C2a now preserves the owner's window on the CHIP formal and every body
+    # use. Keep the exact ctx-query/body structural expectation with that one
+    # additional type field, rather than dropping the structural comparison.
+    expected_chip = BindExpectedWindow().visit_function(expected_chip)
+    ir.assert_structural_equal(chip, expected_chip)
 
     # `host` is compared by assertion rather than structurally: its body is
     # wrapped in a CommDomainScopeStmt by MaterializeCommDomainScopes, and that

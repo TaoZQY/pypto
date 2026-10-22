@@ -64,6 +64,7 @@ from .type_resolver import (
     _const_int_value,  # noqa: PLC2701
     _implicit_tile_view_defaults,  # noqa: PLC2701
     _is_dump_call,  # noqa: PLC2701
+    _ProgramWindowBuffers,  # noqa: PLC2701
 )
 
 if TYPE_CHECKING:
@@ -755,6 +756,7 @@ class ASTParser:
         dyn_var_cache: dict[str, ir.Var] | None = None,
         pending_comments: dict[int, list[tuple[int, str]]] | None = None,
         alloc_window_buffer_names: set[str] | None = None,
+        program_window_buffers: _ProgramWindowBuffers | None = None,
     ):
         """Initialize AST parser.
 
@@ -779,6 +781,8 @@ class ASTParser:
             alloc_window_buffer_names: Optional shared set of declared buffer names
                 (``pld.tensor.alloc_window_buffer`` LHS). Shared across all functions in
                 a ``@pl.program`` to enforce program-wide name uniqueness.
+            program_window_buffers: Private descriptor registry belonging only
+                to this program parse; storage caches stay function-local.
         """
         self.span_tracker = SpanTracker(source_file, source_lines, line_offset, col_offset)
         self.scope_manager = ScopeManager(strict_ssa=strict_ssa)
@@ -792,6 +796,7 @@ class ASTParser:
             span_tracker=self.span_tracker,
             dyn_var_cache=dyn_var_cache,
             parse_expression=self.parse_expression,
+            program_window_buffers=program_window_buffers,
         )
         self.builder = IRBuilder()
         self.global_vars = global_vars or {}  # Track GlobalVars for cross-function calls
@@ -1170,7 +1175,8 @@ class ASTParser:
         func_name = func_def.name
         # Window definitions may follow a signature that references them. Their
         # allocation Vars are interned and adopted at the actual definition site.
-        self.type_resolver.register_window_definitions(func_def)
+        self.type_resolver.window_owner = func_name
+        self.type_resolver.register_window_definitions(func_def, opaque_body=inline_body is not None)
         self._func_name = func_name
         self._func_level = func_level
         self._distributed_level = func_level
@@ -1300,6 +1306,9 @@ class ASTParser:
                 self._parse_body_siblings(body_stmts)
                 self._discard_tail_block_comments(func_def.body, upper_line=None)
 
+            # Manual full descriptors outside comm_domain scopes must bind
+            # while both the owner's builder and lexical scope remain live.
+            self.type_resolver.finalize_window_definitions()
         # Exit function scope
         self.scope_manager.exit_scope()
 
@@ -6449,7 +6458,10 @@ class ASTParser:
                                 "comm_domain attr names must be string literals", span=span
                             )
                         attrs.append((key.value, self._parse_attr_value("comm_domain", key.value, value)))
-                slots.extend(self.type_resolver.resolve_window_buffer(node) for node in slots_node.elts)
+                slots.extend(
+                    self.type_resolver.resolve_window_buffer(node, bind_owner=True)
+                    for node in slots_node.elts
+                )
                 self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
                 self.scope_manager.exit_scope(leak_vars=True)
 

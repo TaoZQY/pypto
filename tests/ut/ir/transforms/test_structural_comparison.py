@@ -607,6 +607,109 @@ def test_window_storage_is_supported(attached):
     equal(node, node)
 
 
+def _program_with_owned_window(
+    size_kind, prefix, *, owner_first=False, bind_second=False, load_from_host=False, store_to_host=False
+):
+    """Construct real owner-local bindings without relying on text parsing."""
+    n, other = var(f"{prefix}_n", D.INDEX), var(f"{prefix}_other", D.INDEX)
+    size = var(f"{prefix}_size", D.INDEX)
+    base = ir.Var(f"{prefix}_buf", ir.PtrType(), SPAN)
+    selected = other if bind_second else n
+    sizes = {
+        "constant": ir.ConstInt(16, D.INDEX, SPAN),
+        "parameter": selected,
+        "local": size,
+        "expression": ir.Mul(selected, ir.ConstInt(4, D.INDEX, SPAN), D.INDEX, SPAN),
+        "free": var("same_external_spelling", D.INDEX),
+    }
+    window = ir.WindowBuffer(base, sizes[size_kind], load_from_host, store_to_host, SPAN)
+    tensor_type = ir.DistributedTensorType([ir.ConstInt(4, D.INDEX, SPAN)], D.FP32, window)
+    value = ir.Var(f"{prefix}_value", tensor_type, SPAN)
+    child_name, owner_name = ("z_child", "a_owner") if owner_first else ("a_child", "z_owner")
+    child = function(child_name, [value])
+    owner = ir.Function(
+        owner_name,
+        [n, other],
+        [],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(size, ir.Mul(n, ir.ConstInt(4, D.INDEX, SPAN), D.INDEX, SPAN), SPAN),
+                ir.AssignStmt(
+                    base,
+                    ir.create_op_call(
+                        "pld.tensor.alloc_window_buffer", [window.size], {"name": "buffer"}, SPAN
+                    ),
+                    SPAN,
+                ),
+                ir.CommDomainScopeStmt([], [window], "domain", body=ir.ReturnStmt([], SPAN), span=SPAN),
+            ],
+            SPAN,
+        ),
+        SPAN,
+        level=ir.Level.HOST,
+        role=ir.Role.Orchestrator,
+    )
+    return ir.Program([child, owner], "OwnedWindow", SPAN)
+
+
+@pytest.mark.parametrize("owner_first", [False, True])
+@pytest.mark.parametrize("size_kind", ["constant", "parameter", "local", "expression"])
+def test_program_owned_window_size_uses_owner_bindings(size_kind, owner_first):
+    """Inherited resource metadata names its real owner's alpha-renamable Vars."""
+    lhs = _program_with_owned_window(size_kind, "left", owner_first=owner_first)
+    rhs = _program_with_owned_window(size_kind, "right", owner_first=owner_first)
+    equal(lhs, rhs)
+
+
+def test_program_owned_window_size_distinguishes_owner_parameter_positions():
+    lhs = _program_with_owned_window("parameter", "left")
+    rhs = _program_with_owned_window("parameter", "right", bind_second=True)
+    equal(lhs, rhs, False)
+    equal(lhs, rhs, False, auto=True)
+    assert ir.structural_hash(lhs) != ir.structural_hash(rhs)
+
+
+@pytest.mark.parametrize("flag", ["load_from_host", "store_to_host"])
+def test_program_owned_window_staging_flags_remain_exact(flag):
+    lhs = _program_with_owned_window("constant", "left")
+    rhs = _program_with_owned_window("constant", "right", **{flag: True})
+    equal(lhs, rhs, False)
+    assert ir.structural_hash(lhs) != ir.structural_hash(rhs)
+
+
+def test_program_owned_window_size_keeps_true_free_variable_identity():
+    lhs = _program_with_owned_window("free", "left")
+    rhs = _program_with_owned_window("free", "right")
+    equal(lhs, rhs, False)
+
+
+def test_program_owned_window_alias_pattern_is_preserved_across_children():
+    """Identical slot fields must not erase which owning slot a child inherits."""
+
+    def program(split):
+        base_a, base_b = ir.Var("a", ir.PtrType(), SPAN), ir.Var("b", ir.PtrType(), SPAN)
+        size = ir.ConstInt(16, D.INDEX, SPAN)
+        first, second = ir.WindowBuffer(base_a, size), ir.WindowBuffer(base_b, size)
+        shape = [ir.ConstInt(4, D.INDEX, SPAN)]
+        x = ir.Var("x", ir.DistributedTensorType(shape, D.FP32, first), SPAN)
+        y = ir.Var("y", ir.DistributedTensorType(shape, D.FP32, second if split else first), SPAN)
+        owner = ir.Function(
+            "z_owner",
+            [],
+            [],
+            ir.CommDomainScopeStmt([], [first, second], "domain", body=ir.ReturnStmt([], SPAN), span=SPAN),
+            SPAN,
+            level=ir.Level.HOST,
+            role=ir.Role.Orchestrator,
+        )
+        return ir.Program([function("a_child", [x]), function("b_child", [y]), owner], "SlotAliases", SPAN)
+
+    lhs, rhs = program(False), program(True)
+    equal(lhs, rhs, False)
+    equal(lhs, rhs, False, auto=True)
+    assert ir.structural_hash(lhs) != ir.structural_hash(rhs)
+
+
 def test_open_stride_symbol_is_not_implicitly_bound():
     def build(prefix):
         n = var(prefix, D.INDEX)

@@ -291,5 +291,30 @@ class TestDeepCloneTypeRemap:
         assert cloned_tile_type.tile_view.valid_shape[0] is i_orig
 
 
+@pytest.mark.parametrize("with_tensor_shape", [False, True])
+def test_nested_tuple_result_types_preserve_scalars_and_remap_tensor_shapes(with_tensor_shape):
+    span = ir.Span.unknown()
+    scalar = ir.ScalarType(DataType.INDEX)
+    original_dim = ir.Var("original_dim", scalar, span)
+    replacement_dim = ir.Var("replacement_dim", scalar, span)
+    field = ir.TensorType([original_dim], DataType.FP32) if with_tensor_shape else scalar
+    nested = ir.TupleType([scalar, field])
+    result_type = ir.TupleType([scalar, nested, scalar])
+    call = ir.Call(ir.GlobalVar("callee"), [original_dim], {}, {}, result_type, span)
+    target = ir.Var("target", result_type, span)
+    cloned, _ = ir.deep_clone(ir.AssignStmt(target, call, span), var_map=[(original_dim, replacement_dim)])
+    assert isinstance(cloned, ir.AssignStmt) and isinstance(cloned.value, ir.Call)
+    assert cloned.var is not target
+    assert cloned.value.args[0] is replacement_dim
+    for ty in [cloned.var.type, cloned.value.type]:
+        assert ty.types[0] is scalar and ty.types[2] is scalar
+        assert ty.types[1].types[0] is scalar
+        if with_tensor_shape:
+            assert ty.types[1].types[1].shape[0] is replacement_dim
+        else:
+            assert ty is result_type
+            assert ty.types[1] is nested
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

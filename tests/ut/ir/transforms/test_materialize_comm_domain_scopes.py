@@ -428,6 +428,10 @@ def test_implicit_allreduce_over_distinct_subsets_gets_distinct_signals():
         def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
             return data
 
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch_other(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
         def host_orch(self):
             buf_a = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
@@ -436,8 +440,8 @@ def test_implicit_allreduce_over_distinct_subsets_gets_distinct_signals():
             data_b = pld.window(buf_b, [256], dtype=pl.FP32)
             self.chip_orch(data_a, device=0)
             self.chip_orch(data_a, device=1)
-            self.chip_orch(data_b, device=2)
-            self.chip_orch(data_b, device=3)
+            self.chip_orch_other(data_b, device=2)
+            self.chip_orch_other(data_b, device=3)
             data_a = pld.tensor.allreduce(data_a, op=pld.ReduceOp.Sum)
             data_b = pld.tensor.allreduce(data_b, op=pld.ReduceOp.Sum)
             return data_a
@@ -754,6 +758,10 @@ def test_implicit_allreduce_signal_names_are_program_unique():
                 def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
                     return data
 
+                @pl.function(type=pl.FunctionType.Orchestration)
+                def chip_orch_other(self, data: pld.DistributedTensor[[256], pl.FP32]):
+                    return data
+
                 @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
                 def host_orch_a(self):
                     data_buf = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
@@ -777,7 +785,7 @@ def test_implicit_allreduce_signal_names_are_program_unique():
                     data_buf_b = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
                     data = pld.window(data_buf_b, [256], dtype=pl.FP32)
                     for r in pl.range(pld.world_size()):
-                        self.chip_orch(data, device=r)
+                        self.chip_orch_other(data, device=r)
                     data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
                     return data
             """
@@ -1684,11 +1692,11 @@ def test_multi_view_per_alloc_shares_wb_instance():
 
 
 # ---------------------------------------------------------------------------
-# chip_orch param types remain nullopt (host_orch only is rewritten)
+# Dispatch formals inherit the owner's exact window identity.
 # ---------------------------------------------------------------------------
 
 
-def test_chip_orch_param_types_keep_window_buffer_nullopt():
+def test_c2a_chip_orch_formal_and_body_share_owner_window_identity():
     @pl.program
     class P:
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -1705,12 +1713,16 @@ def test_chip_orch_param_types_keep_window_buffer_nullopt():
 
     result = _apply(P)
     chip = _get_func(result, "chip_orch")
-    # The param annotation came from the user; its DistributedTensorType
-    # should carry no window_buffer back-reference even after the pass runs.
+    # The formal and every use must reference the existing owner slot; creating
+    # an equal-looking second WindowBuffer would lose allocation ownership.
     assert len(chip.params) == 1
     pt = chip.params[0].type
     assert isinstance(pt, ir.DistributedTensorType)
-    assert pt.window_buffer is None
+    slot = _get_comm_domain_scopes(_get_func(result, "host_orch"))[0].slots[0]
+    assert pt.window_buffer is slot
+    returns = [stmt for stmt in _flatten_stmts(chip.body) if isinstance(stmt, ir.ReturnStmt)]
+    assert returns[0].value[0] is chip.params[0]
+    assert returns[0].value[0].type.window_buffer is slot
 
 
 # ---------------------------------------------------------------------------
@@ -1921,6 +1933,10 @@ def _build_pass_output_with_two_groups() -> ir.Program:
         def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
             return data
 
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch_other(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
         def host_orch(self):
             buf_a = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
@@ -1929,7 +1945,7 @@ def _build_pass_output_with_two_groups() -> ir.Program:
             data_b = pld.window(buf_b, [256], dtype=pl.FP32)
             for r in pl.range(pld.world_size()):
                 self.chip_orch(data_a, device=r)
-            self.chip_orch(data_b, device=0)
+            self.chip_orch_other(data_b, device=0)
             return 0
 
     return _apply(P)
@@ -2002,6 +2018,10 @@ def test_materialized_program_text_roundtrip(explicit_layout):
         def chip(self, x: pld.DistributedTensor[[4], pl.FP32]):
             return x
 
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_other(self, x: pld.DistributedTensor[[4], pl.FP32]):
+            return x
+
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
         def host(self, n: pl.Scalar[pl.INDEX]):
             size = n * 4
@@ -2013,7 +2033,7 @@ def test_materialized_program_text_roundtrip(explicit_layout):
             for r in pl.range(2):
                 self.chip(x, device=r)
                 self.chip(alias, device=r)
-            self.chip(other, device=2)
+            self.chip_other(other, device=2)
             return 0
 
     ir.assert_structural_equal(P, pl.parse(ir.python_print(P, format=False)))
@@ -2282,6 +2302,1181 @@ def test_c1b_dynamic_full_coverage_requires_zero_start_unit_step(query, hoisted,
     before = _c1b_dynamic_dispatch_program(query, hoisted=hoisted, start=start, step=step)
     with pytest.raises(ValueError, match="start|step|full.coverage"):
         _apply(before)
+
+
+def _c2a_stmts(stmt):
+    yield stmt
+    if isinstance(stmt, ir.SeqStmts):
+        for child in stmt.stmts:
+            yield from _c2a_stmts(child)
+    elif isinstance(stmt, (ir.ScopeStmt, ir.ForStmt, ir.WhileStmt)):
+        yield from _c2a_stmts(stmt.body)
+    elif isinstance(stmt, ir.IfStmt):
+        yield from _c2a_stmts(stmt.then_body)
+        if stmt.else_body is not None:
+            yield from _c2a_stmts(stmt.else_body)
+
+
+def _c2a_exprs(expr):
+    yield expr
+    if isinstance(expr, (ir.Call, ir.Submit)):
+        for arg in expr.args:
+            yield from _c2a_exprs(arg)
+        if isinstance(expr, ir.Submit):
+            for dep in expr.deps:
+                yield from _c2a_exprs(dep)
+    elif isinstance(expr, ir.MakeTuple):
+        for element in expr.elements:
+            yield from _c2a_exprs(element)
+    elif isinstance(expr, ir.TupleGetItemExpr):
+        yield from _c2a_exprs(expr.tuple)
+
+
+def _c2a_dist_types(ty):
+    if isinstance(ty, ir.DistributedTensorType):
+        yield ty
+    elif isinstance(ty, ir.TupleType):
+        for element in ty.types:
+            yield from _c2a_dist_types(element)
+
+
+def _c2a_assert_function_identity(func, slot):
+    """Check signatures, defining expressions, projections, and SSA carries."""
+    types = [param.type for param in func.params] + list(func.return_types)
+    for stmt in _c2a_stmts(func.body):
+        exprs = []
+        if isinstance(stmt, ir.AssignStmt):
+            exprs = [stmt.var, stmt.value]
+        elif isinstance(stmt, ir.EvalStmt):
+            exprs = [stmt.expr]
+        elif isinstance(stmt, (ir.ReturnStmt, ir.YieldStmt)):
+            exprs = list(stmt.value)
+        elif isinstance(stmt, (ir.ForStmt, ir.WhileStmt)):
+            exprs = list(stmt.iter_args) + list(stmt.return_vars)
+            exprs += [arg.initValue for arg in stmt.iter_args]
+        elif isinstance(stmt, ir.IfStmt):
+            exprs = list(stmt.return_vars)
+        for expr in exprs:
+            types.extend(value.type for value in _c2a_exprs(expr))
+    distributed = [dt for ty in types for dt in _c2a_dist_types(ty)]
+    assert distributed, f"{func.name} must contain distributed values"
+    assert all(dt.window_buffer is slot for dt in distributed)
+
+
+def _c2a_three_level_program(names=("z_root", "a_host", "m_chip"), *, hoisted=False, start="0", step="1"):
+    root, host, chip = names
+    bound = "count_alias" if hoisted else "pld.num_workers()"
+    hoist = "        count = pld.num_workers()\n        count_alias = count\n" if hoisted else ""
+    return pl.parse_program(
+        f"""
+@pl.program
+class ThreeLevels:
+    @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+    def {chip}(self, data: pld.DistributedTensor[[4], pl.FP32]) -> pld.DistributedTensor[[4], pl.FP32]:
+        return data
+
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def {host}(self, data: pld.DistributedTensor[[4], pl.FP32]) -> pld.DistributedTensor[[4], pl.FP32]:
+        forwarded = self.{chip}(data, worker=0)
+        return forwarded
+
+    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+    def {root}(self, begin: pl.Scalar[pl.INDEX], stride: pl.Scalar[pl.INDEX]):
+        buf = pld.alloc_window_buffer(16)
+        data = pld.window(buf, [4], dtype=pl.FP32)
+{hoist}        for worker in pl.range({start}, {bound}, {step}):
+            self.{host}(data, worker=worker)
+        return 0
+"""
+    )
+
+
+@pytest.mark.parametrize("names", [("z_root", "a_host", "m_chip"), ("a_root", "z_host", "b_chip")])
+@pytest.mark.parametrize("hoisted", [False, True])
+def test_c2a_three_levels_share_identity_independent_of_function_order(names, hoisted):
+    before = _c2a_three_level_program(names, hoisted=hoisted)
+    after = _apply(before)
+    root, host, chip = [_get_func(after, name) for name in names]
+    scopes = _get_comm_domain_scopes(root)
+    assert len(scopes) == 1
+    assert list(scopes[0].devices) == []
+    assert len(scopes[0].slots) == 1
+    slot = scopes[0].slots[0]
+    for func in (root, host, chip):
+        _c2a_assert_function_identity(func, slot)
+    assert _get_comm_domain_scopes(host) == []
+    assert _get_comm_domain_scopes(chip) == []
+    props = passes.IRPropertySet()
+    props.insert(passes.IRProperty.AssignTypeSymmetry)
+    props.insert(passes.IRProperty.TypeChecked)
+    assert passes.PropertyVerifierRegistry.verify(props, after) == []
+
+
+@pytest.mark.parametrize("roundtrip", ["idempotence", "text", "serde"])
+def test_c2a_cross_function_identity_survives_roundtrip(roundtrip):
+    before = _apply(_c2a_three_level_program())
+    if roundtrip == "idempotence":
+        after = passes.materialize_comm_domain_scopes()(before)
+    elif roundtrip == "text":
+        after = pl.parse_program(ir.python_print(before, format=False))
+    else:
+        after = ir.deserialize(ir.serialize(before))
+    ir.assert_structural_equal(before, after)
+    slot = _get_comm_domain_scopes(_get_func(after, "z_root"))[0].slots[0]
+    for name in ("z_root", "a_host", "m_chip"):
+        _c2a_assert_function_identity(_get_func(after, name), slot)
+
+
+def test_c2a_local_and_inherited_windows_have_separate_owners():
+    before = pl.parse_program("""
+@pl.program
+class LocalAndInherited:
+    @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+    def chip(
+        self, inherited: pld.DistributedTensor[[4], pl.FP32], local: pld.DistributedTensor[[4], pl.FP32]
+    ):
+        return inherited, local
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def host(self, inherited: pld.DistributedTensor[[4], pl.FP32]):
+        local_buf = pld.alloc_window_buffer(16)
+        local = pld.window(local_buf, [4], dtype=pl.FP32)
+        self.chip(inherited, local, worker=0)
+        return inherited
+    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+    def root(self):
+        buf = pld.alloc_window_buffer(16)
+        inherited = pld.window(buf, [4], dtype=pl.FP32)
+        self.host(inherited, worker=0)
+        return 0
+""")
+    after = _apply(before)
+    root, host, chip = [_get_func(after, name) for name in ("root", "host", "chip")]
+    root_scope, host_scope = _get_comm_domain_scopes(root)[0], _get_comm_domain_scopes(host)[0]
+    assert len(root_scope.slots) == len(host_scope.slots) == 1
+    global_slot, local_slot = root_scope.slots[0], host_scope.slots[0]
+    assert global_slot is not local_slot
+    assert host.params[0].type.window_buffer is chip.params[0].type.window_buffer is global_slot
+    assert _view_var_types(host)[0].window_buffer is chip.params[1].type.window_buffer is local_slot
+    assert _get_comm_domain_scopes(chip) == []
+
+
+@pytest.mark.parametrize("lineage", ["alias_view", "writeback", "for", "while", "branch"])
+def test_c2a_inherited_identity_through_local_lineage(lineage):
+    bodies = {
+        "alias_view": """
+        alias = data
+        sliced = pl.slice(alias, [4], [0])
+        packed = (alias, sliced)
+        result = packed[1]
+""",
+        "writeback": """
+        sliced = pl.slice(data, [4], [0])
+        result = pl.assemble(data, sliced, [0])
+""",
+        "for": """
+        for _, (carried,) in pl.range(2, init_values=(data,)):
+            result = pl.yield_(carried)
+""",
+        "while": """
+        for (carried,) in pl.while_(init_values=(data,)):
+            pl.cond(flag)
+            result = pl.yield_(carried)
+""",
+        "branch": """
+        if flag:
+            result = pl.yield_(data)
+        else:
+            result = pl.yield_(data)
+""",
+    }
+    before = pl.parse_program(
+        """
+@pl.program
+class Lineage:
+    @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+    def chip(self, data: pld.DistributedTensor[[4], pl.FP32]):
+        return data
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def host(self, data: pld.DistributedTensor[[4], pl.FP32], flag: pl.Scalar[pl.BOOL]):
+"""
+        + bodies[lineage]
+        + """
+        returned = self.chip(result, worker=0)
+        return returned
+    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+    def root(self, flag: pl.Scalar[pl.BOOL]):
+        buf = pld.alloc_window_buffer(16)
+        data = pld.window(buf, [4], dtype=pl.FP32)
+        self.host(data, flag, worker=0)
+        return 0
+"""
+    )
+    after = _apply(before)
+    slot = _get_comm_domain_scopes(_get_func(after, "root"))[0].slots[0]
+    for name in ("host", "chip"):
+        _c2a_assert_function_identity(_get_func(after, name), slot)
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_c2a_multiple_callers_require_one_object_identity(conflict):
+    # Equal shapes do not make separately owned windows interchangeable.
+    extra = "        other_buf = pld.alloc_window_buffer(16)\n"
+    extra += "        other = pld.window(other_buf, [4], dtype=pl.FP32)\n"
+    before = pl.parse_program(
+        """
+@pl.program
+class MultipleCallers:
+    @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+    def chip(self, data: pld.DistributedTensor[[4], pl.FP32]):
+        return data
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def host(self):
+        buf = pld.alloc_window_buffer(16)
+        data = pld.window(buf, [4], dtype=pl.FP32)
+"""
+        + (extra if conflict else "        other = data\n")
+        + """
+        self.chip(data, worker=0)
+        self.chip(other, worker=0)
+        return 0
+"""
+    )
+    if conflict:
+        with pytest.raises(ValueError, match="[Cc]onflict.*[Ww]indow|[Ww]indow.*[Cc]onflict"):
+            _apply(before)
+    else:
+        after = _apply(before)
+        slot = _get_comm_domain_scopes(_get_func(after, "host"))[0].slots[0]
+        _c2a_assert_function_identity(_get_func(after, "chip"), slot)
+
+
+def test_c2a_distinct_existing_windows_with_same_name_and_shape_conflict():
+    span = ir.Span.unknown()
+    shape = [ir.ConstInt(4, DataType.INDEX, span)]
+    size = ir.ConstInt(16, DataType.INDEX, span)
+    unbound_type = ir.DistributedTensorType(shape, pl.FP32)
+    formal = ir.Var("data", unbound_type, span)
+    chip = ir.Function(
+        "chip",
+        [formal],
+        [unbound_type],
+        ir.ReturnStmt([formal], span),
+        span,
+        level=ir.Level.CHIP,
+        role=ir.Role.Orchestrator,
+    )
+    owners = []
+    for name in ("first_host", "second_host"):
+        base = ir.Var("buf", ir.PtrType(), span)
+        slot = ir.WindowBuffer(base, size)
+        ty = ir.DistributedTensorType(shape, pl.FP32, slot)
+        actual = ir.Var("data", ty, span)
+        call = ir.Call(ir.GlobalVar("chip"), [actual], {}, {}, unbound_type, span)
+        body = ir.CommDomainScopeStmt(
+            [0],
+            [slot],
+            "saved",
+            body=ir.EvalStmt(call, span),
+            span=span,
+        )
+        owners.append(
+            ir.Function(
+                name,
+                [actual],
+                [],
+                body,
+                span,
+                level=ir.Level.HOST,
+                role=ir.Role.Orchestrator,
+            )
+        )
+    # Pre-existing owner metadata is sufficient to identify both parameters;
+    # body allocations are irrelevant to the distinct-object conflict.
+    before = ir.Program([chip, *owners], "SameNameConflict", span)
+    with passes.PassContext([], verification_level=passes.VerificationLevel.NONE):
+        with pytest.raises(ValueError, match="[Cc]onflict.*[Ww]indow|[Ww]indow.*[Cc]onflict"):
+            passes.materialize_comm_domain_scopes()(before)
+
+
+@pytest.mark.parametrize("reverse_names", [False, True])
+def test_c2a_shared_formal_object_rewrites_every_function_owner(reverse_names):
+    """Native functions may share a formal/body DAG; neither owner may be skipped."""
+    span = ir.Span.unknown()
+    shape = [ir.ConstInt(4, DataType.INDEX, span)]
+    ty = ir.DistributedTensorType(shape, pl.FP32)
+    shared_formal = ir.Var("shared_formal", ty, span)
+    shared_body = ir.SeqStmts([ir.EvalStmt(shared_formal, span), ir.ReturnStmt([], span)], span)
+    names = ["z_first", "a_second"] if reverse_names else ["a_first", "z_second"]
+    children = [
+        ir.Function(
+            name, [shared_formal], [], shared_body, span, level=ir.Level.CHIP, role=ir.Role.Orchestrator
+        )
+        for name in names
+    ]
+    assert children[0].params[0] is children[1].params[0]
+    assert children[0].body is children[1].body
+    buffer = ir.Var("buf", ir.PtrType(), span)
+    data = ir.Var("data", ty, span)
+    alloc = ir.create_op_call(
+        "pld.tensor.alloc_window_buffer", [ir.ConstInt(16, DataType.INDEX, span)], {"name": "buf"}, span
+    )
+    window = ir.create_op_call(
+        "pld.tensor.window", [buffer, ir.MakeTuple(shape, span)], {"dtype": pl.FP32}, span
+    )
+    calls = [
+        ir.EvalStmt(
+            ir.Call(
+                ir.GlobalVar(name),
+                [data],
+                {},
+                {"worker": ir.ConstInt(0, DataType.INDEX, span)},
+                ir.TupleType([]),
+                span,
+            ),
+            span,
+        )
+        for name in names
+    ]
+    host = ir.Function(
+        "host",
+        [],
+        [],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(buffer, alloc, span),
+                ir.AssignStmt(data, window, span),
+                *calls,
+                ir.ReturnStmt([], span),
+            ],
+            span,
+        ),
+        span,
+        level=ir.Level.HOST,
+        role=ir.Role.Orchestrator,
+    )
+    before = ir.Program([*children, host], "SharedFunctionOwners", span)
+    # This legal native input already satisfies SSA. Preprocessing could clone
+    # the shared formal and hide the multiple function owners being tested.
+    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+        after = passes.materialize_comm_domain_scopes()(before)
+    slot = _get_comm_domain_scopes(_get_func(after, "host"))[0].slots[0]
+    for name in names:
+        child = _get_func(after, name)
+        assert child.params[0].type.window_buffer is slot
+        assert child.body.stmts[0].expr is child.params[0]
+        assert child.body.stmts[0].expr.type.window_buffer is slot
+        assert child.return_types == []
+
+
+@pytest.mark.parametrize("reverse_names", [False, True])
+def test_c2a_shared_scalar_attr_root_rewrites_nested_owner_call_in_every_function(reverse_names):
+    """A scalar root can contain a changed DT call in a shared native attr DAG."""
+    span = ir.Span.unknown()
+    shape = [ir.ConstInt(4, DataType.INDEX, span)]
+    ty = ir.DistributedTensorType(shape, pl.FP32)
+    formal = ir.Var("formal", ty, span)
+    chip = ir.Function(
+        "chip",
+        [formal],
+        [],
+        ir.ReturnStmt([], span),
+        span,
+        level=ir.Level.CHIP,
+        role=ir.Role.Orchestrator,
+    )
+    buffer = ir.Var("buf", ir.PtrType(), span)
+    data = ir.Var("data", ty, span)
+    alloc = ir.create_op_call(
+        "pld.tensor.alloc_window_buffer", [ir.ConstInt(16, DataType.INDEX, span)], {"name": "buf"}, span
+    )
+    window = ir.create_op_call(
+        "pld.tensor.window", [buffer, ir.MakeTuple(shape, span)], {"dtype": pl.FP32}, span
+    )
+    dispatch = ir.Call(
+        ir.GlobalVar("chip"),
+        [data],
+        {},
+        {"worker": ir.ConstInt(0, DataType.INDEX, span)},
+        ir.TupleType([]),
+        span,
+    )
+    owner = ir.Function(
+        "owner",
+        [],
+        [ty],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(buffer, alloc, span),
+                ir.AssignStmt(data, window, span),
+                ir.EvalStmt(dispatch, span),
+                ir.ReturnStmt([data], span),
+            ],
+            span,
+        ),
+        span,
+        level=ir.Level.HOST,
+        role=ir.Role.Orchestrator,
+    )
+    owner_call = ir.Call(ir.GlobalVar("owner"), [], {}, {}, ty, span)
+    context_query = ir.create_op_call("pld.system.get_comm_ctx", [owner_call], {}, span)
+    scalar_root = ir.create_op_call("pld.system.rank", [context_query], {}, span)
+    names = ["z_first", "a_second"] if reverse_names else ["a_first", "z_second"]
+    users = [
+        ir.Function(
+            name,
+            [],
+            [],
+            ir.ReturnStmt([], span),
+            span,
+            level=ir.Level.HOST,
+            role=ir.Role.Orchestrator,
+            attrs={"nested_owner": scalar_root, "ordinary": "kept", "count": 7},
+        )
+        for name in names
+    ]
+    assert users[0].attrs["nested_owner"] is users[1].attrs["nested_owner"]
+    before = ir.Program([*users, owner, chip], "SharedScalarAttribute", span)
+    # No preprocessing: preserve the shared expression object and verify this
+    # parameter-free, closed attribute expression as legal native IR directly.
+    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+        after = passes.materialize_comm_domain_scopes()(before)
+    rewritten_owner = _get_func(after, "owner")
+    slot = _get_comm_domain_scopes(rewritten_owner)[0].slots[0]
+    assert rewritten_owner.return_types[0].window_buffer is slot
+    assert _get_func(after, "chip").params[0].type.window_buffer is slot
+    for name in names:
+        user = _get_func(after, name)
+        assert user.params == [] and user.return_types == []
+        assert isinstance(user.body, ir.ReturnStmt) and user.body.value == []
+        assert user.attrs["ordinary"] == "kept" and user.attrs["count"] == 7
+        root = user.attrs["nested_owner"]
+        assert isinstance(root, ir.Call) and root.op.name == ir.get_op("pld.system.rank").name
+        assert root.type.dtype == DataType.INT32
+        query = root.args[0]
+        assert isinstance(query, ir.Call) and query.op.name == ir.get_op("pld.system.get_comm_ctx").name
+        assert isinstance(query.type, ir.CommCtxType)
+        nested = query.args[0]
+        assert isinstance(nested, ir.Call) and isinstance(nested.op, ir.GlobalVar)
+        assert nested.op.name == "owner"
+        assert nested.type.window_buffer is slot
+
+
+def _c2a_scalar_tuple_calls_program(width, calls, mixed, kind):
+    """Share one scalar result type across calls to a flat-return native callee."""
+    span = ir.Span.unknown()
+    index_type = ir.ScalarType(DataType.INDEX)
+    shape = [ir.ConstInt(4, DataType.INDEX, span)]
+    ty = ir.DistributedTensorType(shape, pl.FP32)
+    formal = ir.Var("formal", ty, span)
+    child = ir.Function(
+        "scalar_child",
+        [formal] if mixed else [],
+        [index_type] * width,
+        ir.ReturnStmt([ir.ConstInt(i, DataType.INDEX, span) for i in range(width)], span),
+        span,
+        level=ir.Level.CHIP,
+        role=ir.Role.Orchestrator,
+    )
+    buffer = ir.Var("buf", ir.PtrType(), span)
+    data = ir.Var("data", ty, span)
+    dependency = ir.Var("dependency", ir.ScalarType(DataType.TASK_ID), span)
+    statements = []
+    if mixed:
+        alloc = ir.create_op_call(
+            "pld.tensor.alloc_window_buffer", [ir.ConstInt(16, DataType.INDEX, span)], {"name": "buf"}, span
+        )
+        window = ir.create_op_call(
+            "pld.tensor.window", [buffer, ir.MakeTuple(shape, span)], {"dtype": pl.FP32}, span
+        )
+        statements.extend([ir.AssignStmt(buffer, alloc, span), ir.AssignStmt(data, window, span)])
+    result_fields = [index_type] * width
+    if kind == "submit":
+        result_fields.append(ir.ScalarType(DataType.TASK_ID))
+    shared_result_type = ir.TupleType(result_fields)
+    launches = []
+    for i in range(calls):
+        attrs = {"ordinary": "kept"}
+        if mixed:
+            attrs["worker"] = ir.ConstInt(0, DataType.INDEX, span)
+        if kind == "submit":
+            launch = ir.Submit(
+                ir.GlobalVar("scalar_child"),
+                [data] if mixed else [],
+                [dependency],
+                {},
+                attrs,
+                shared_result_type,
+                span,
+                core_num=ir.ConstInt(2, DataType.INDEX, span),
+                sync_start=True,
+                allow_early_resolve=True,
+                predicate=ir.ConstBool(True, span),
+            )
+        else:
+            launch = ir.Call(
+                ir.GlobalVar("scalar_child"), [data] if mixed else [], {}, attrs, shared_result_type, span
+            )
+        packed = ir.Var(f"packed_{i}", shared_result_type, span)
+        launches.append(ir.AssignStmt(packed, launch, span))
+        if kind == "submit":
+            tid = ir.Var(f"tid_{i}", result_fields[-1], span)
+            launches.append(ir.AssignStmt(tid, ir.TupleGetItemExpr(packed, width, span), span))
+    if kind == "submit":
+        statements.append(ir.RuntimeScopeStmt(manual=True, body=ir.SeqStmts(launches, span), span=span))
+    else:
+        statements.extend(launches)
+    statements.append(ir.ReturnStmt([], span))
+    host = ir.Function(
+        "host",
+        [dependency] if kind == "submit" else [],
+        [],
+        ir.SeqStmts(statements, span),
+        span,
+        level=ir.Level.HOST,
+        role=ir.Role.Orchestrator,
+    )
+    return ir.Program([child, host], "ScalarTupleCalls", span)
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("kind", ["call", "submit"])
+def test_c2a_shared_scalar_tuple_call_results_keep_abi_and_changed_dt_arguments(mixed, kind):
+    before = _c2a_scalar_tuple_calls_program(4, 3, mixed, kind)
+    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+        after = passes.materialize_comm_domain_scopes()(before)
+    host, child = _get_func(after, "host"), _get_func(after, "scalar_child")
+    assert len(child.return_types) == 4
+    assert all(ty.dtype == DataType.INDEX for ty in child.return_types)
+    calls = [
+        stmt.value
+        for stmt in _c2a_stmts(host.body)
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, (ir.Call, ir.Submit))
+        and isinstance(stmt.value.op, ir.GlobalVar)
+    ]
+    assert len(calls) == 3
+    if mixed:
+        slot = _get_comm_domain_scopes(host)[0].slots[0]
+        assert child.params[0].type.window_buffer is slot
+        window_var = _find_window_calls(host)[0].var
+    else:
+        assert after is before
+        assert child.params == []
+    for call in calls:
+        assert call.attrs["ordinary"] == "kept"
+        assert len(call.type.types) == (5 if kind == "submit" else 4)
+        assert all(ty.dtype == DataType.INDEX for ty in call.type.types[:4])
+        if mixed:
+            assert call.args[0] is window_var
+            assert call.args[0].type.window_buffer is slot
+        else:
+            assert call.args == []
+        if kind == "submit":
+            assert isinstance(call, ir.Submit)
+            assert call.deps[0] is host.params[0]
+            assert call.type.types[4].dtype == DataType.TASK_ID
+            assert call.core_num.value == 2
+            assert call.sync_start and call.allow_early_resolve and call.predicate.value
+        else:
+            assert isinstance(call, ir.Call)
+    if kind == "submit":
+        projections = [
+            stmt
+            for stmt in _c2a_stmts(host.body)
+            if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.TupleGetItemExpr)
+        ]
+        assert len(projections) == 3
+        assert all(stmt.value.index == 4 and stmt.var.type.dtype == DataType.TASK_ID for stmt in projections)
+
+
+def _c2a_ordinary_tuple_program(width, aliases, mixed):
+    """Build a shared type DAG with O(width + aliases) ordinary IR nodes."""
+    span = ir.Span.unknown()
+    scalar = ir.ScalarType(DataType.INT32)
+    shared_type = ir.TupleType([scalar] * width)
+    parameter = ir.Var("ordinary_input", shared_type, span)
+    previous = parameter
+    statements = []
+    for index in range(aliases):
+        alias = ir.Var(f"ordinary_alias_{index}", shared_type, span)
+        statements.append(ir.AssignStmt(alias, previous, span))
+        previous = alias
+    statements.append(ir.ReturnStmt([previous], span))
+    ordinary = ir.Function(
+        "ordinary",
+        [parameter],
+        [shared_type],
+        ir.SeqStmts(statements, span),
+        span,
+        attrs={"ordinary": "kept", "count": 7, "reference": parameter},
+    )
+    functions = [ordinary]
+    if mixed:
+        owner = pl.parse_program("""
+@pl.program
+class UnrelatedWindow:
+    @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+    def chip(self, data: pld.DistributedTensor[[4], pl.FP32]):
+        return data
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def host(self):
+        unrelated_buf = pld.alloc_window_buffer(16)
+        data = pld.window(unrelated_buf, [4], dtype=pl.FP32)
+        self.chip(data, worker=0)
+        return 0
+""")
+        functions.extend(owner.functions.values())
+    return ir.Program(functions, "OrdinaryTypeDag", span)
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_c2a_shared_ordinary_tuple_dag_retains_function_and_metadata(mixed):
+    before = _c2a_ordinary_tuple_program(16, 24, mixed)
+    ordinary = _get_func(before, "ordinary")
+    shared_type = ordinary.params[0].type
+    # The input is already legal SSA. Avoid a preprocessing clone so exact
+    # object preservation measures only this materializer's behavior.
+    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+        after = passes.materialize_comm_domain_scopes()(before)
+    preserved = _get_func(after, "ordinary")
+    assert preserved is ordinary
+    assert preserved.params[0].type is shared_type
+    assert preserved.return_types[0] is shared_type
+    assert preserved.attrs["ordinary"] == "kept"
+    assert preserved.attrs["count"] == 7
+    assert preserved.attrs["reference"] is preserved.params[0]
+    assignments = [stmt for stmt in preserved.body.stmts if isinstance(stmt, ir.AssignStmt)]
+    assert len(assignments) == 24
+    assert all(stmt.var.type is shared_type and stmt.value.type is shared_type for stmt in assignments)
+    if mixed:
+        slot = _get_comm_domain_scopes(_get_func(after, "host"))[0].slots[0]
+        _c2a_assert_function_identity(_get_func(after, "chip"), slot)
+    else:
+        assert after is before
+
+
+@pytest.mark.parametrize("payload_kind", ["formal", "reference_list", "view", "tuple_projection"])
+def test_c2a_function_expr_attrs_share_rewritten_formal_identity(payload_kind):
+    """Function attr expressions are live references, including attr-only views."""
+    span = ir.Span.unknown()
+    size = ir.ConstInt(16, DataType.INDEX, span)
+    shape = [ir.ConstInt(4, DataType.INDEX, span)]
+    ty = ir.DistributedTensorType(shape, pl.FP32)
+    formal = ir.Var("formal", ty, span)
+    ctx = ir.Var("ctx", ir.CommCtxType(), span)
+    view = ir.create_op_call(
+        "tensor.slice",
+        [formal, ir.MakeTuple(shape, span), ir.MakeTuple([ir.ConstInt(0, DataType.INDEX, span)], span)],
+        {},
+        span,
+    )
+    # The expression exists only in attrs, so merely substituting the formal
+    # cannot fix its result/tuple types without indexing attr lineage as well.
+    projection = ir.TupleGetItemExpr(ir.MakeTuple([view, ctx], span), 0, span)
+    payloads = {"formal": formal, "reference_list": [formal], "view": view, "tuple_projection": projection}
+    chip = ir.Function(
+        "chip",
+        [formal, ctx],
+        [ty],
+        ir.ReturnStmt([formal], span),
+        span,
+        level=ir.Level.CHIP,
+        role=ir.Role.Orchestrator,
+        attrs={"custom_reference": payloads[payload_kind], "ordinary": "kept", "count": 7},
+    )
+    buffer = ir.Var("buf", ir.PtrType(), span)
+    data = ir.Var("data", ty, span)
+    alloc = ir.create_op_call("pld.tensor.alloc_window_buffer", [size], {"name": "buf"}, span)
+    window = ir.create_op_call(
+        "pld.tensor.window", [buffer, ir.MakeTuple(shape, span)], {"dtype": pl.FP32}, span
+    )
+    call = ir.Call(
+        ir.GlobalVar("chip"), [data, ctx], {}, {"worker": ir.ConstInt(0, DataType.INDEX, span)}, ty, span
+    )
+    host = ir.Function(
+        "host",
+        [ctx],
+        [],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(buffer, alloc, span),
+                ir.AssignStmt(data, window, span),
+                ir.EvalStmt(call, span),
+                ir.ReturnStmt([], span),
+            ],
+            span,
+        ),
+        span,
+        level=ir.Level.HOST,
+        role=ir.Role.Orchestrator,
+    )
+    # Generic Expr-valued function attrs exceed the private DSL printer's
+    # supported syntax. Keep native verification for this native API fixture.
+    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+        prepared = _synthesize(passes.convert_to_ssa()(ir.Program([chip, host], "FunctionAttrs", span)))
+        prepared_chip = _get_func(prepared, "chip")
+        prepared_formal, prepared_ctx = prepared_chip.params
+        prepared_type = prepared_formal.type
+        after = passes.materialize_comm_domain_scopes()(prepared)
+    rewritten = _get_func(after, "chip")
+    slot = _get_comm_domain_scopes(_get_func(after, "host"))[0].slots[0]
+    assert rewritten.params[0] is not prepared_formal
+    assert rewritten.params[0].type.window_buffer is slot
+    expected_type = ir.DistributedTensorType(
+        prepared_type.shape, prepared_type.dtype, prepared_type.memref, prepared_type.tensor_view, slot
+    )
+    ir.assert_structural_equal(rewritten.params[0].type, expected_type)
+    assert rewritten.params[1] is prepared_ctx
+    assert rewritten.return_types[0].window_buffer is slot
+    assert isinstance(rewritten.body, ir.ReturnStmt)
+    assert rewritten.body.value[0] is rewritten.params[0]
+    assert rewritten.attrs["ordinary"] == "kept"
+    assert rewritten.attrs["count"] == 7
+    payload = rewritten.attrs["custom_reference"]
+    if payload_kind == "reference_list":
+        assert list(payload) == [rewritten.params[0]]
+        assert payload[0] is rewritten.params[0]
+    elif payload_kind == "formal":
+        assert payload is rewritten.params[0]
+    else:
+        assert payload.type.window_buffer is slot
+        if payload_kind == "tuple_projection":
+            assert isinstance(payload, ir.TupleGetItemExpr)
+            assert payload.tuple.type.types[0].window_buffer is slot
+            assert payload.tuple.elements[1] is rewritten.params[1]
+            payload = payload.tuple.elements[0]
+        assert isinstance(payload, ir.Call)
+        assert payload.type.window_buffer is slot
+        assert payload.args[0] is rewritten.params[0]
+
+
+@pytest.mark.parametrize("kind", ["call", "submit"])
+def test_c2a_sparse_tuple_return_positions_preserve_scalar_gaps_and_task_id(kind):
+    span = ir.Span.unknown()
+    index_type = ir.ScalarType(DataType.INDEX)
+    tensor_type = ir.DistributedTensorType([ir.ConstInt(4, DataType.INDEX, span)], pl.FP32)
+    formal = ir.Var("formal", tensor_type, span)
+    returns = [index_type, tensor_type, index_type, tensor_type]
+    chip = ir.Function(
+        "chip",
+        [formal],
+        returns,
+        ir.ReturnStmt(
+            [ir.ConstInt(0, DataType.INDEX, span), formal, ir.ConstInt(2, DataType.INDEX, span), formal], span
+        ),
+        span,
+        level=ir.Level.CHIP,
+        role=ir.Role.Orchestrator,
+    )
+    buffer = ir.Var("buf", ir.PtrType(), span)
+    data = ir.Var("data", tensor_type, span)
+    dependency = ir.Var("dependency", ir.ScalarType(DataType.TASK_ID), span)
+    size = ir.ConstInt(16, DataType.INDEX, span)
+    alloc = ir.create_op_call("pld.tensor.alloc_window_buffer", [size], {"name": "buf"}, span)
+    window = ir.create_op_call(
+        "pld.tensor.window", [buffer, ir.MakeTuple(tensor_type.shape, span)], {"dtype": pl.FP32}, span
+    )
+    attrs = {"worker": ir.ConstInt(0, DataType.INDEX, span), "ordinary": "kept"}
+    if kind == "submit":
+        returns = [*returns, ir.ScalarType(DataType.TASK_ID)]
+        invocation = ir.Submit(
+            ir.GlobalVar("chip"),
+            [data],
+            [dependency],
+            {},
+            attrs,
+            ir.TupleType(returns),
+            span,
+            core_num=ir.ConstInt(2, DataType.INDEX, span),
+            sync_start=True,
+            allow_early_resolve=True,
+            predicate=ir.ConstBool(True, span),
+        )
+    else:
+        invocation = ir.Call(ir.GlobalVar("chip"), [data], {}, attrs, ir.TupleType(returns), span)
+    packed = ir.Var("packed", invocation.type, span)
+    projections = [ir.Var(f"projection_{index}", ty, span) for index, ty in enumerate(returns)]
+    launch_statements = [ir.AssignStmt(packed, invocation, span)] + [
+        ir.AssignStmt(var, ir.TupleGetItemExpr(packed, index, span), span)
+        for index, var in enumerate(projections)
+    ]
+    if kind == "submit":
+        launch_statements = [
+            ir.RuntimeScopeStmt(
+                manual=True,
+                body=ir.SeqStmts(launch_statements, span),
+                span=span,
+            )
+        ]
+    host = ir.Function(
+        "host",
+        [dependency] if kind == "submit" else [],
+        [tensor_type, tensor_type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(buffer, alloc, span),
+                ir.AssignStmt(data, window, span),
+                *launch_statements,
+                ir.ReturnStmt([projections[1], projections[3]], span),
+            ],
+            span,
+        ),
+        span,
+        level=ir.Level.HOST,
+        role=ir.Role.Orchestrator,
+    )
+    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+        after = _apply(ir.Program([chip, host], "SparseReturnPositions", span))
+    rewritten_host, rewritten_chip = _get_func(after, "host"), _get_func(after, "chip")
+    slot = _get_comm_domain_scopes(rewritten_host)[0].slots[0]
+    assert rewritten_chip.params[0].type.window_buffer is slot
+    assert rewritten_chip.body.value[1] is rewritten_chip.params[0]
+    assert rewritten_chip.body.value[3] is rewritten_chip.params[0]
+    assert len(rewritten_chip.return_types) == 4
+    for index in [0, 2]:
+        assert rewritten_chip.return_types[index].dtype == DataType.INDEX
+    for index in [1, 3]:
+        assert rewritten_chip.return_types[index].window_buffer is slot
+    assignments = [stmt for stmt in _c2a_stmts(rewritten_host.body) if isinstance(stmt, ir.AssignStmt)]
+    launch = next(
+        stmt.value
+        for stmt in assignments
+        if isinstance(stmt.value, (ir.Call, ir.Submit)) and isinstance(stmt.value.op, ir.GlobalVar)
+    )
+    assert launch.attrs["ordinary"] == "kept"
+    assert len(launch.type.types) == len(returns)
+    projected = [stmt for stmt in assignments if isinstance(stmt.value, ir.TupleGetItemExpr)]
+    assert [stmt.value.index for stmt in projected] == list(range(len(returns)))
+    for index, stmt in enumerate(projected):
+        ir.assert_structural_equal(stmt.var.type, launch.type.types[index])
+        ir.assert_structural_equal(stmt.value.type, launch.type.types[index])
+        if index in [1, 3]:
+            assert stmt.var.type.window_buffer is slot
+            assert stmt.value.type.window_buffer is slot
+        else:
+            expected_dtype = DataType.TASK_ID if index == 4 else DataType.INDEX
+            assert stmt.var.type.dtype == expected_dtype
+    assert all(ty.window_buffer is slot for ty in rewritten_host.return_types)
+    if kind == "submit":
+        assert isinstance(launch, ir.Submit)
+        assert launch.deps[0] is rewritten_host.params[0]
+        assert launch.type.types[4].dtype == DataType.TASK_ID
+        assert launch.core_num.value == 2
+        assert launch.sync_start and launch.allow_early_resolve
+        assert launch.predicate.value is True
+    else:
+        assert isinstance(launch, ir.Call)
+
+
+@pytest.mark.parametrize("kind,supplied_out", [("call", True), ("submit", True), ("submit", False)])
+@pytest.mark.parametrize("with_ctx", [False, True])
+def test_c2a_call_submit_binding_retains_local_metadata_and_task_fields(kind, supplied_out, with_ctx):
+    """An omitted Out is a gap, not a caller value or the trailing ctx argument.
+
+    Native nodes expose launch fields and deliberately different callee MemRef
+    metadata; only the WindowBuffer field may be inherited from the caller.
+    """
+    span = ir.Span.unknown()
+    size = ir.ConstInt(16, DataType.INDEX, span)
+    shape = [ir.ConstInt(4, DataType.INDEX, span)]
+    local_type = ir.DistributedTensorType(shape, pl.FP32)
+    memref = ir.MemRef("callee_storage", 0, 16, span)
+    view = ir.TensorView(stride=[1], layout=ir.TensorLayout.ND)
+    formal_type = ir.DistributedTensorType(shape, pl.FP32, memref, view)
+    formal = ir.Var("data", formal_type, span)
+    output = ir.Var("output", local_type, span)
+    ctx = ir.Var("ctx", ir.CommCtxType(), span)
+    callee_params = [(formal, ir.ParamDirection.In), (output, ir.ParamDirection.Out)]
+    if with_ctx:
+        callee_params.append((ctx, ir.ParamDirection.In))
+    callee = ir.Function(
+        "chip",
+        callee_params,
+        [formal_type, local_type],
+        ir.ReturnStmt([formal, output], span),
+        span,
+        level=ir.Level.CHIP,
+        role=ir.Role.Orchestrator,
+    )
+    buffer = ir.Var("buf", ir.PtrType(), span)
+    data = ir.Var("data", local_type, span)
+    alloc = ir.create_op_call("pld.tensor.alloc_window_buffer", [size], {"name": "buf"}, span)
+    window = ir.create_op_call(
+        "pld.tensor.window", [buffer, ir.MakeTuple(shape, span)], {"dtype": pl.FP32}, span
+    )
+    dep = ir.Var("dependency", ir.ScalarType(DataType.TASK_ID), span)
+    args = [data] + ([data] if supplied_out else []) + ([ctx] if with_ctx else [])
+    attrs = {"worker": ir.ConstInt(0, DataType.INDEX, span), "saved": "identity-test"}
+    returned = [local_type, local_type]
+    if kind == "submit":
+        returned.append(ir.ScalarType(DataType.TASK_ID))
+        invocation = ir.Submit(
+            ir.GlobalVar("chip"),
+            args,
+            [dep],
+            {},
+            attrs,
+            ir.TupleType(returned),
+            span,
+            core_num=ir.ConstInt(2, DataType.INDEX, span),
+            sync_start=True,
+            allow_early_resolve=True,
+            predicate=ir.ConstBool(True, span),
+        )
+    else:
+        invocation = ir.Call(ir.GlobalVar("chip"), args, {}, attrs, ir.TupleType(returned), span)
+    packed = ir.Var("packed", invocation.type, span)
+    first = ir.Var("first", local_type, span)
+    launch_body = ir.SeqStmts(
+        [
+            ir.AssignStmt(packed, invocation, span),
+            ir.AssignStmt(first, ir.TupleGetItemExpr(packed, 0, span), span),
+        ],
+        span,
+    )
+    if kind == "submit":
+        launch_body = ir.RuntimeScopeStmt(manual=True, body=launch_body, span=span)
+    launch_stmts = list(launch_body.stmts) if isinstance(launch_body, ir.SeqStmts) else [launch_body]
+    caller_params = ([ctx] if with_ctx else []) + ([dep] if kind == "submit" else [])
+    caller = ir.Function(
+        "host",
+        caller_params,
+        [local_type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(buffer, alloc, span),
+                ir.AssignStmt(data, window, span),
+                *launch_stmts,
+                ir.ReturnStmt([first], span),
+            ],
+            span,
+        ),
+        span,
+        level=ir.Level.HOST,
+        role=ir.Role.Orchestrator,
+    )
+    # This native ABI fixture includes a runtime-allocated Out gap on a HOST
+    # Submit and low-level launch fields not authored by the current DSL. Keep
+    # native verification; textual round-trip coverage lives in its own test.
+    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+        after = _apply(ir.Program([callee, caller], "Binding", span))
+    host, chip = _get_func(after, "host"), _get_func(after, "chip")
+    slot = _get_comm_domain_scopes(host)[0].slots[0]
+    data_type, output_type = chip.params[0].type, chip.params[1].type
+    assert data_type.window_buffer is slot
+    assert data_type.memref is memref
+    # TensorView is a value type: its constructor input and the type's cached
+    # Python getter wrapper need not be the same object. Check every recorded
+    # field structurally, retaining separate MemRef/WindowBuffer identity checks.
+    expected_type = ir.DistributedTensorType(shape, pl.FP32, memref, formal_type.tensor_view, slot)
+    ir.assert_structural_equal(data_type, expected_type)
+    assert data_type.dtype == pl.FP32
+    assert [dim.value for dim in data_type.shape] == [4]
+    assert output_type.window_buffer is (slot if supplied_out else None)
+    assert chip.return_types[0].window_buffer is slot
+    assert chip.return_types[1].window_buffer is (slot if supplied_out else None)
+    assignments = [stmt for stmt in _c2a_stmts(host.body) if isinstance(stmt, ir.AssignStmt)]
+    launch = next(
+        stmt.value
+        for stmt in assignments
+        if isinstance(stmt.value, (ir.Call, ir.Submit)) and isinstance(stmt.value.op, ir.GlobalVar)
+    )
+    assert launch.attrs["saved"] == "identity-test"
+    assert len(launch.args) == len(args)
+    if with_ctx:
+        assert isinstance(launch.args[-1].type, ir.CommCtxType)
+    assert launch.type.types[0].window_buffer is slot
+    assert launch.type.types[1].window_buffer is (slot if supplied_out else None)
+    projection = next(stmt for stmt in assignments if isinstance(stmt.value, ir.TupleGetItemExpr))
+    assert projection.var.type.window_buffer is projection.value.type.window_buffer is slot
+    if kind == "submit":
+        assert isinstance(launch, ir.Submit)
+        assert len(launch.deps) == 1
+        assert launch.deps[0] is host.params[-1]
+        assert launch.type.types[-1].dtype == DataType.TASK_ID
+        assert launch.core_num.value == 2
+        assert launch.sync_start and launch.allow_early_resolve
+        assert launch.predicate.value is True
+    else:
+        assert isinstance(launch, ir.Call)
+
+
+def test_c2a_orphan_typed_formal_is_rejected_but_nullable_device_formal_is_allowed():
+    span = ir.Span.unknown()
+    shape = [ir.ConstInt(4, DataType.INDEX, span)]
+    slot = ir.WindowBuffer(ir.Var("orphan", ir.PtrType(), span), ir.ConstInt(16, DataType.INDEX, span))
+    for window in (None, slot):
+        ty = ir.DistributedTensorType(shape, pl.FP32, None, None, window)
+        param = ir.Var("data", ty, span)
+        func = ir.Function(
+            "chip",
+            [param],
+            [ty],
+            ir.ReturnStmt([param], span),
+            span,
+            level=ir.Level.CHIP,
+            role=ir.Role.Orchestrator,
+        )
+        before = ir.Program([func], "Standalone", span)
+        if window is None:
+            after = passes.materialize_comm_domain_scopes()(before)
+            ir.assert_structural_equal(before, after)
+        else:
+            # An intentionally invalid identity cannot round-trip: the printer
+            # has no scope definition to emit. Pin the pass's own diagnostic.
+            with passes.PassContext([], verification_level=passes.VerificationLevel.NONE):
+                with pytest.raises(ValueError, match="[Oo]rphan|[Oo]wner|[Ss]cope"):
+                    passes.materialize_comm_domain_scopes()(before)
+
+
+@pytest.mark.parametrize("start,step", [("1", "1"), ("0", "2"), ("begin", "1"), ("0", "stride")])
+def test_c2a_cluster_dynamic_coverage_rejects_noncanonical_range(start, step):
+    before = _c2a_three_level_program(start=start, step=step)
+    with pytest.raises(ValueError, match="start|step|full.coverage"):
+        _apply(before)
+
+
+@pytest.mark.parametrize("binding", ["nullable", "orphan", "owned"])
+def test_c2a_property_verifier_checks_formal_window_ownership_without_running_pass(binding):
+    """A serialized/externally constructed program must satisfy the property too."""
+    span = ir.Span.unknown()
+    shape = [ir.ConstInt(4, DataType.INDEX, span)]
+    size = ir.ConstInt(16, DataType.INDEX, span)
+    base = ir.Var("buf", ir.PtrType(), span)
+    slot = ir.WindowBuffer(base, size)
+    ty = ir.DistributedTensorType(shape, pl.FP32, None, None, None if binding == "nullable" else slot)
+    formal = ir.Var("data", ty, span)
+    chip = ir.Function(
+        "chip",
+        [formal],
+        [ty],
+        ir.ReturnStmt([formal], span),
+        span,
+        level=ir.Level.CHIP,
+        role=ir.Role.Orchestrator,
+    )
+    functions = [chip]
+    if binding == "owned":
+        data = ir.Var("data", ty, span)
+        alloc = ir.create_op_call("pld.tensor.alloc_window_buffer", [size], {"name": "buf"}, span)
+        window = ir.Call(
+            ir.get_op("pld.tensor.window"),
+            [base, ir.MakeTuple(shape, span)],
+            {"dtype": pl.FP32},
+            {},
+            ty,
+            span,
+        )
+        call = ir.Call(
+            ir.GlobalVar("chip"), [data], {}, {"worker": ir.ConstInt(0, DataType.INDEX, span)}, ty, span
+        )
+        body = ir.CommDomainScopeStmt(
+            [0],
+            [slot],
+            "owned",
+            body=ir.SeqStmts(
+                [
+                    ir.AssignStmt(base, alloc, span),
+                    ir.AssignStmt(data, window, span),
+                    ir.EvalStmt(call, span),
+                    ir.ReturnStmt([], span),
+                ],
+                span,
+            ),
+            span=span,
+        )
+        functions.append(
+            ir.Function(
+                "host",
+                [],
+                [],
+                body,
+                span,
+                level=ir.Level.HOST,
+                role=ir.Role.Orchestrator,
+            )
+        )
+    props = passes.IRPropertySet()
+    props.insert(passes.IRProperty.CommDomainScopesMaterialized)
+    diagnostics = passes.PropertyVerifierRegistry.verify(props, ir.Program(functions, "Ownership", span))
+    errors = [item for item in diagnostics if item.severity == passes.DiagnosticSeverity.Error]
+    if binding == "orphan":
+        assert errors, "the verifier must reject a typed formal whose WindowBuffer has no owner"
+        assert all(item.rule_name == "CommDomainScopesMaterialized" for item in errors)
+        assert any("orphan" in item.message.lower() or "owner" in item.message.lower() for item in errors)
+    else:
+        assert errors == []
+
+
+@pytest.mark.parametrize("repetitions", [1, 32])
+def test_c2a_repeated_collective_edges_observe_updated_source_coverage(repetitions):
+    """A repeated A -> S edge must see A's new coverage after B -> A.
+
+    This pins directed evidence union while repeated consumers are deduplicated;
+    widening the data domains as an undirected component would also be wrong.
+    """
+    dispatches = "        self.chip_a(a, worker=0)\n        self.chip_b(b, worker=1)\n" * repetitions
+    consume = "        a = pld.tensor.allreduce(a, signal, op=pld.ReduceOp.Sum)\n" * repetitions
+    before = pl.parse_program(
+        """
+@pl.program
+class CoverageSnapshots:
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def chip_a(self, data: pld.DistributedTensor[[4], pl.FP32]):
+        return data
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def chip_b(self, data: pld.DistributedTensor[[4], pl.FP32]):
+        return data
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def host(self):
+        a_buf = pld.alloc_window_buffer(16)
+        b_buf = pld.alloc_window_buffer(16)
+        signal_buf = pld.alloc_window_buffer(16)
+        a = pld.window(a_buf, [4], dtype=pl.FP32)
+        b = pld.window(b_buf, [4], dtype=pl.FP32)
+        a_signal = pld.window(a_buf, [4], dtype=pl.INT32)
+        signal = pld.window(signal_buf, [4], dtype=pl.INT32)
+"""
+        + dispatches
+        + consume
+        + "        b = pld.tensor.allreduce(b, a_signal, op=pld.ReduceOp.Sum)\n"
+        + consume
+        + "        return 0\n"
+    )
+    after = _apply(before)
+    host = _get_func(after, "host")
+    scopes = _get_comm_domain_scopes(host)
+    assert [list(scope.devices) for scope in scopes] == [[0, 1], [1]]
+    assert [len(scope.slots) for scope in scopes] == [2, 1]
+    a_type, b_type, a_signal_type, signal_type = _view_var_types(host)
+    assert a_type.window_buffer is scopes[0].slots[0]
+    assert a_signal_type.window_buffer is a_type.window_buffer
+    assert signal_type.window_buffer is scopes[0].slots[1]
+    assert b_type.window_buffer is scopes[1].slots[0]
+
+
+def test_c2a_host_owner_keeps_chip_graph_out_of_dispatch_coverage():
+    before = pl.parse_program("""
+@pl.program
+class GraphCompatibility:
+    @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+    def chip(self, data: pld.DistributedTensor[[4], pl.FP32]):
+        return data
+    @pl.function(type=pl.FunctionType.Graph)
+    def graph(self, data: pld.DistributedTensor[[4], pl.FP32]):
+        return data
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def host(self):
+        buf = pld.alloc_window_buffer(16)
+        data = pld.window(buf, [4], dtype=pl.FP32)
+        self.chip(data, worker=0)
+        self.graph(data)
+        return 0
+""")
+    after = _apply(before)
+    scope = _get_comm_domain_scopes(_get_func(after, "host"))[0]
+    assert list(scope.devices) == [0]
+    _c2a_assert_function_identity(_get_func(after, "chip"), scope.slots[0])
 
 
 if __name__ == "__main__":

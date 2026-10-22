@@ -2,8 +2,9 @@
 
 ## Overview
 
-`MaterializeCommDomainScopes` walks each host-orchestration function and assembles the
-host-side metadata that the distributed runtime needs in order to size and
+`MaterializeCommDomainScopes` materializes local communication domains in HOST
+and CLUSTER_0 orchestration functions. It assembles the host-side metadata that
+the distributed runtime needs in order to size and
 populate per-rank communication windows. It is the structural analogue of
 [`InitMemRef`](35-init_memref.md): it traces an allocation through to its
 consumption points, constructs a back-reference object, and threads it onto
@@ -17,7 +18,7 @@ the IR types so downstream codegen has O(1) access.
 | Wrapper's SSA-edge type | `MemRefType` (singleton) | `WindowBufferType` (singleton) |
 | Built by | `InitMemRef` | **`MaterializeCommDomainScopes`** (this pass) |
 | Threaded back onto | `TensorType.memref_` | `DistributedTensorType.window_buffer_` |
-| IR-level registry | `Program.functions_` (alloc stmts) | `CommDomainScopeStmt` wrapping each host_orch body (one per inferred comm domain) |
+| IR-level registry | `Program.functions_` (alloc stmts) | `CommDomainScopeStmt` in each local owner's body (one per inferred comm domain) |
 
 ## Position in the pipeline
 
@@ -37,109 +38,111 @@ collected sizes is applied uniformly.
 
 ## Algorithm
 
-For every host-orchestration function (`Function::level_ == Level::HOST` and
-`Function::role_ == Role::Orchestrator`, regardless of `func_type_`):
+The pass handles local owners at `Level::HOST` and `Level::CLUSTER_0` with
+`Role::Orchestrator`; canonical `FunctionType::Orchestration` declarations are
+also accepted. Coverage is inferred only from adjacent dispatches:
+`HOST -> CHIP` and `CLUSTER_0 -> HOST`. A CHIP `Graph` is not a HOST dispatch
+target. HOST collective analysis and signal synthesis retain their HOST-only
+contract.
 
-1. **Collect allocations.** Find every `AssignStmt` whose RHS is a
-   `pld.tensor.alloc_window_buffer(size, *, name)` Call. Record `(ptr_var, size_expr,
-   name, span, call)`.
+1. **Collect local allocations.** Index each owner's allocation/window pairs,
+   skipping already materialized scope bodies. Create one `WindowBuffer` per
+   local allocation. A formal inherited from another owner never becomes a local
+   slot, so a HOST function can use both its own domains and an inherited
+   CLUSTER_0 domain.
+2. **Index program identity.** Build a graph over values, tuple positions and
+   declared return positions. Seed local windows and pre-existing identities.
+   Cache each callee's trailing `CommCtx` count and explicit return-to-parameter
+   map once. Bind actuals to formals for resolved `Call` and `Submit` expressions.
+   Supplied `Out` operands participate; omitted runtime `Out` operands have no
+   caller provenance and cannot consume a trailing context argument.
+3. **Propagate identity once.** Follow SSA aliases, registry-declared aliasing
+   views/writebacks, managed collective results, explicit returns, tuple
+   construction/projection, and loop init/`IterArg`/yield/return edges. Branch
+   merges require both inputs to resolve to the same object. An unknown input
+   does not prove consensus. Arbitrary allocating tensor operations do not
+   establish window identity. A value accepts one object; a second distinct
+   object is an error even when names, shapes and dtypes match. Repeated callers
+   using the same object are accepted without function cloning.
+4. **Infer local coverage.** Resolve a dispatch argument's identity to the
+   current owner's local allocation index. Inherited windows are not inserted
+   into this index. The canonical placement attribute is `worker`; the parser
+   normalizes the deprecated `device` spelling.
 
-2. **Collect views.** For every `AssignStmt` whose RHS is a
-   `pld.tensor.window(ptr_var, [shape], *, dtype)` Call referencing a recorded
-   `ptr_var`, record the binding `view_var → alloc`.
+   | `worker=` expression | Coverage |
+   | -------------------- | -------- |
+   | Non-negative `ConstInt(N)` | `{N}` |
+   | Induction variable of `[0, num_workers())`, step 1 | All children |
+   | Induction variable of `[0, world_size())`, step 1, at HOST | All children |
+   | Induction variable of a static unit-step range | That range |
+   | Unsupported or unproven dynamic start/step | Error |
 
-3. **Scan dispatches.** Walk the body with a stack of enclosing `ForStmt`s.
-   For every Call whose `op_` is a `GlobalVar` resolving to a chip-level
-   orchestration, read `attrs["device"]` and infer a **device descriptor**
-   from the device expression in the current loop context:
+   Direct and SSA-hoisted child-count queries use the same memoized bound
+   analysis. `world_size` remains illegal at CLUSTER_0. HOST collective signals
+   and `all_to_all_v` count windows retain the existing paired-coverage rules.
+5. **Group and rewrite.** Merge coverage per local allocation, group matching
+   descriptors by canonical snapshot ID, and retain allocation order within each
+   group. One final mutator rebuilds affected signatures, body and function-attr references,
+   preserving each value's own shape, dtype, `MemRef` and tensor view while
+   replacing only `window_buffer_`. It also updates declared returns, Call/
+   Submit tuple result types, projections and loop types. Submit dependencies,
+   attributes, launch fields, predicate and trailing `TASK_ID` are preserved.
+   Wrap only real local allocations in nested `CommDomainScopeStmt` nodes;
+   previously owned windows retain their existing objects.
 
-   | `device=` shape | Descriptor |
-   | --------------- | ---------- |
-   | `ConstInt(N)` | `subset = {N}` |
-   | `IterArg of for r in pl.range(pld.system.world_size())` | `kAll` |
-   | `IterArg of for r in pl.range(ConstInt(N))` | `subset = {0, …, N − 1}` |
-   | other | `pypto::ValueError` |
+The IR traversal and identity work queue are `O(N + E)`: each identity is
+assigned once and each edge is processed once. Type relevance is memoized over
+the shared type DAG; tuple lineage stores only DT-bearing positions, retaining
+their original ABI indices. Ordinary scalar tuple fields are not expanded per
+value. Changed tuple-root flags are computed once, then a bounded boolean queue
+propagates mutation requirements through child-to-parent expression edges. This
+also catches a scalar or context root containing a changed DT call. Function/root
+use edges mark every affected function, including native functions sharing one
+formal, body or attribute expression object. Functions without identity or
+local-domain changes bypass mutation. Call/Submit result bindings store only
+DT-bearing `(original ABI index, value)` entries, so a wide scalar-only return
+list is not scanned at every call. The shared base mutator memoizes scalar-only
+type trees using strong immutable `TypePtr` keys: these trees contain no embedded
+expressions or subclass callbacks, including in Call/Submit result types.
+Tensor shapes, views and other expression-bearing types still use the shared
+remapper. Direct dispatch coverage uses
+mutable interval maps (`O(D log D)` for `D` interval insertions), then freezes
+once per allocation. Numeric ranges stay as intervals until a domain's sorted
+device list is emitted. Allocations share canonical immutable coverage snapshots;
+collective consumers update destination snapshots in source order, caching each
+distinct snapshot-pair union. Grouping uses snapshot IDs, so identical large
+sets are not copied or compared once per consumer or allocation.
 
-   Every positional dispatch arg that is a recorded view Var contributes that
-   descriptor to its underlying allocation.
+Coverage retains a complexity exception: each uncached collective union costs
+`O(I_left + I_right)` interval work plus ordered canonical-key comparisons;
+comparisons can inspect interval prefixes. Stored snapshots consume the sum of
+their interval counts, and emitted device lists cost their total member count.
+Many distinct overlapping unions can still take quadratic work in IR size even
+with a small final output. This residual bound requires explicit approval before
+merge under the pass-complexity rule; no universal `O(N log N)` bound is claimed.
+The pass does not rescan bodies to a fixed point, scan all formals per call, or
+retrace alias chains per use. Existing scopes make repeated application idempotent.
 
-4. **Merge descriptors.** Per allocation, fold every recorded descriptor:
-   any `kAll` ⇒ `kAll`; otherwise union the subsets. A host-level collective's
-   signal (and, for `pld.tensor.all_to_all_v`, its `recv_counts`) carries no
-   `device=` of its own, so it inherits device coverage from the collective's
-   paired data/target allocation instead — a call may register more than one
-   such pairing sharing the same data allocation (`all_to_all_v` registers two:
-   one for `signal`, one for `recv_counts`).
+## Diagnostics and output invariants
 
-5. **Materialise `WindowBuffer`s.** For each allocation construct
-   `WindowBuffer(base = ptr_var, size = size_expr, load_from_host = false,
-   store_to_host = false)`. The `Var::name_hint_` is inherited from
-   `ptr_var->name_hint_`. (Host-staging flags are placeholders for N4+.)
+- Missing views and allocations without a consuming adjacent dispatch retain
+  their existing diagnostics. Unsupported coverage expressions, ambiguous
+  identity and non-null identities without an owning scope are rejected.
+- Every materialized window and its supported aliases, callee formals, returns
+  and projections share the exact same `WindowBuffer` object as the owning
+  scope slot. Nullable standalone device formals can remain unbound.
+- A scope owns only its function's local slots. Inherited slots are never
+  copied into a child scope. Function iteration order cannot select a caller's
+  identity or change the result.
+- Assignments remain type-symmetric; preserving original shape/view metadata
+  leaves genuine type mismatches visible to verification.
+- HOST `allreduce` still has an explicit or synthesized signal after
+  [`SynthesizeAllReduceSignals`](46-synthesize_allreduce_signals.md).
+  The existing HOST `all_to_all_v` restriction inside `for`/`while` remains.
 
-6. **Rewrite view types** *(host_orch only)*. For every view binding, mint a
-   fresh `Var` of the same `name_hint_` whose type is
-   `DistributedTensorType(shape, dtype, memref, tensor_view, wb)` and run
-   `Substitute` to swap every reference to the old view Var with the fresh
-   one. `Substitute` rewrites *references* only, so the Call that defines each
-   re-typed Var is then re-minted with the same `window_buffer_`-bearing type —
-   otherwise the assignment ends the pass with the back-reference on its LHS
-   and not on its RHS, violating
-   [`AssignTypeSymmetry`](99-verifier.md#built-in-rules). The re-mint only ever
-   *adds* the back-reference: it keeps the rebuilt type only when that type is
-   structurally equal to the Var's, so a genuine shape / dtype / view
-   disagreement is left for the verifier to report. Two `pld.tensor.window`
-   views over the same allocation share the same
-   `shared_ptr<const WindowBuffer>`. Chip-orch / InCore parameter types are
-   not touched.
-
-7. **Cluster into comm domains.** Walk the allocation list in source order;
-   append a slot to the first existing comm domain whose merged device
-   descriptor matches, or open a new one.
-
-8. **Wrap the body in scope statements.** Build a chain of nested
-   `CommDomainScopeStmt`s — one per comm domain, outer = first declared,
-   inner = last — and substitute it for the host_orch function body. Each
-   scope carries its `devices` list and its slot vector; `name_hint_` is
-   set to `"comm_d<n>"` so codegen emits the matching `__comm_d<n>` handle
-   variable verbatim.
-
-## Sanity checks
-
-The pass raises `pypto::ValueError` (carrying the alloc's span) if:
-
-- An allocation has no `pld.tensor.window` materialisation (dead alloc).
-- An allocation has at least one view but no chip-orch dispatch consumes it.
-- The `device=` expression on a dispatch is something other than `ConstInt`
-  or a recognised `pl.range` induction var.
-- Two allocations within the same comm domain share a `name_hint_` (the
-  parser already enforces global uniqueness; the pass re-asserts).
-- A `pld.tensor.all_to_all_v` call sits inside a `for`/`while` loop in a HOST
-  orchestrator — dynamic re-invocation needs loop-carried window lifetime
-  management this compiler does not model yet (the credit-based signal itself
-  is reusable across sequential calls); same restriction `LowerCompositeOps`
-  enforces on the InCore path.
-
-## Output invariants
-
-After the pass:
-
-- Every host_orch function whose body contains at least one alloc has its
-  body wrapped in a chain of nested `CommDomainScopeStmt`s (one per
-  inferred comm domain, outer = first declared, inner = last).
-  Allocation-free host_orchs are left unchanged.
-- Every `pld.tensor.window` result Var's type is a `DistributedTensorType` whose
-  `window_buffer_` field points to the corresponding `WindowBuffer`, and the
-  defining Call carries that same type — both sides of the assignment agree.
-- Every host-level `pld.tensor.allreduce` call has two positional arguments
-  after [`SynthesizeAllReduceSignals`](46-synthesize_allreduce_signals.md) runs.
-  For an omitted user signal, the second argument is a synthesized Var produced
-  by a preceding `pld.tensor.window` assignment.
-- `pld.tensor.window` views over the same allocation share the same
-  `shared_ptr<const WindowBuffer>` — pointer-equality is a load-bearing
-  invariant for downstream codegen.
-- Chip-orchestration and InCore parameter types remain `nullopt` on
-  `window_buffer_`. N7 codegen reads the back-reference at the *host_orch*
-  dispatch site and threads the matching `CommContext` pointer explicitly.
+This is the bounded domain/identity stage. It does not add CLUSTER_0 collective
+lowering, change context materialization, or enable the complete L4 `compile`
+pipeline; those require their later lowering/runtime stages.
 
 ## Text round-trip
 

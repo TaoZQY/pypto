@@ -2,7 +2,7 @@
 
 ## 概览
 
-`MaterializeCommDomainScopes` 扫描每个 host-orchestration 函数，组装出分布式 runtime
+`MaterializeCommDomainScopes` 物化 HOST 和 CLUSTER_0 orchestration 的本地通信域，组装出分布式 runtime
 为分配 / 填充 per-rank 通信窗口所需要的 host 侧元数据。它与
 [`InitMemRef`](35-init_memref.md) 在结构上完全同构：追溯一次分配到所有
 消费点，构造反向引用对象，再把该对象挂到 IR 类型上，让下游 codegen 能 O(1)
@@ -16,7 +16,7 @@
 | 包装类的 SSA-edge 类型 | `MemRefType`（singleton） | `WindowBufferType`（singleton） |
 | 构造者 | `InitMemRef` | **`MaterializeCommDomainScopes`**（本 pass） |
 | 回填到 | `TensorType.memref_` | `DistributedTensorType.window_buffer_` |
-| Program 级注册表 | `Program.functions_`（alloc 语句） | `CommDomainScopeStmt wrappers in each host_orch body` |
+| Program 级注册表 | `Program.functions_`（alloc 语句） | 各本地所有者函数体内的 `CommDomainScopeStmt`（每个推导出的通信域一个） |
 
 ## 流水线位置
 
@@ -34,89 +34,88 @@ alloc / view / dispatch 点在此时仍然可见。放在较晚阶段还能让�
 
 ## 算法
 
-对每个 host-orchestration 函数（`Function::level_ == Level::HOST` 且
-`Function::role_ == Role::Orchestrator`，不强求 `func_type_`）：
+本 pass 支持 `Level::HOST` 和 `Level::CLUSTER_0` 上的
+`Role::Orchestrator` 本地所有者，也接受规范化的
+`FunctionType::Orchestration` 声明。覆盖范围只从相邻层级 dispatch 推导：
+`HOST -> CHIP` 和 `CLUSTER_0 -> HOST`。CHIP `Graph` 不是 HOST dispatch
+目标。HOST collective 分析和 signal 合成仍只作用于 HOST。
 
-1. **收集 alloc**。找到所有 RHS 是 `pld.tensor.alloc_window_buffer(size, *, name)`
-   的 `AssignStmt`。记录 `(ptr_var, size_expr, name, span, call)`。
+1. **收集本地分配。** 为每个所有者建立 allocation/window 索引，跳过已有物化
+   scope 的函数体。每个本地分配构造一个 `WindowBuffer`。从其他所有者继承的
+   形参永远不会成为本地 slot，因此 HOST 函数可以同时使用自己的通信域和继承的
+   CLUSTER_0 通信域。
+2. **建立程序级身份图。** 图节点覆盖值、tuple 元素和声明的返回位置，以本地
+   window 和已有身份为起点。每个 callee 的尾部 `CommCtx` 数量和显式返回值到
+   形参的映射只缓存一次。对已解析的 `Call` 和 `Submit` 建立实参到形参绑定。
+   调用者提供的 `Out` 实参参与传播；省略并由 runtime 分配的 `Out` 没有调用者
+   来源，也不会错误占用尾部 context 实参。
+3. **一次传播身份。** 沿 SSA 别名、注册表声明的别名 view/writeback、托管
+   collective 结果、显式返回、tuple 构造/投影，以及循环 init/`IterArg`/
+   yield/return 边传播。分支合流要求两个输入都解析到同一个对象；未知输入不能
+   证明一致。任意新分配 tensor 运算不会建立 window 身份。每个值只接受一个
+   对象；第二个不同对象即使名称、shape 和 dtype 相同也报错。同一对象可被多个
+   调用点重复使用，不复制函数。
+4. **推导本地覆盖范围。** 通过 dispatch 实参的身份查询当前所有者的本地分配
+   索引。继承的 window 不进入该索引。规范位置属性为 `worker`；parser 会把
+   已弃用的 `device` 写法规范化。
 
-2. **收集 view**。所有 RHS 是 `pld.tensor.window(ptr_var, [shape], *, dtype)`、且
-   引用已记录 `ptr_var` 的 `AssignStmt`，记录 `view_var → alloc` 绑定。
+   | `worker=` 表达式 | 覆盖范围 |
+   | ---------------- | -------- |
+   | 非负 `ConstInt(N)` | `{N}` |
+   | `[0, num_workers())`、步长为 1 的归纳变量 | 所有子节点 |
+   | HOST 上 `[0, world_size())`、步长为 1 的归纳变量 | 所有子节点 |
+   | 静态单位步长 range 的归纳变量 | 该 range |
+   | 不支持或无法证明的动态起点/步长 | 报错 |
 
-3. **扫描 dispatch**。带着 `ForStmt` 栈遍历函数体。对每个 `op_` 是
-   `GlobalVar` 且解析到 chip-level orchestration 的 Call，读 `attrs["device"]`，
-   在当前 for 循环上下文中推导 **device 描述符**：
+   直接调用和 SSA 提升后的子节点数量查询使用相同的带缓存边界分析。
+   CLUSTER_0 上仍禁止 `world_size`。HOST collective signal 和
+   `all_to_all_v` count window 保留已有配对覆盖规则。
+5. **分组并改写。** 合并各本地分配的覆盖范围，通过规范化快照 ID 查找分组，并保留
+   组内分配顺序。最后只进行一次 mutator 改写，同步函数签名、函数体和函数属性引用；保留每个值
+   自身的 shape、dtype、`MemRef` 和 tensor view，只替换 `window_buffer_`。
+   同步声明的返回类型、Call/Submit tuple 结果、投影和循环类型。保留 Submit 的
+   dependency、属性、launch 字段、predicate 和尾部 `TASK_ID`。
+   仅为真实本地分配嵌套 `CommDomainScopeStmt`；已有窗口保留原对象。
 
-   | `device=` 形态 | 描述符 |
-   | -------------- | ------ |
-   | `ConstInt(N)` | `subset = {N}` |
-   | `for r in pl.range(pld.system.world_size())` 的 IterArg | `kAll` |
-   | `for r in pl.range(ConstInt(N))` 的 IterArg | `subset = {0, …, N − 1}` |
-   | 其它 | `pypto::ValueError` |
+IR 遍历和身份工作队列的复杂度为 `O(N + E)`：每个身份只赋值一次，每条边只处理
+一次。类型相关性在共享类型 DAG 上记忆化；tuple 血缘只存储含 DT 的位置，并保留
+原 ABI 索引。普通标量 tuple 字段不会按值重复展开。tuple 根的变化标志只计算一次，
+随后用有界布尔队列沿子表达式到父表达式的边传播改写需求，因此也能发现包含已变化
+DT 调用的标量或上下文根。函数/根使用边标记全部受影响函数，包括共享同一形参、
+函数体或属性表达式对象的 native 函数。没有身份或本地 domain 变化的函数直接跳过
+改写。Call/Submit 的结果绑定只保存含 DT 的 `(原 ABI 索引, 值)` 项，因此不会在
+每个调用点扫描宽的纯标量返回列表。共享 base mutator 用持有对象的不可变 `TypePtr`
+键记忆化纯标量类型树：这些树没有嵌入表达式或子类回调，包括 Call/Submit 结果类型。
+Tensor 的 shape、view 等含表达式的类型仍使用共享 remapper。
+直接 dispatch 的覆盖使用可变区间映射（`D` 次区间插入为 `O(D log D)`），
+随后每个分配只冻结一次。数值范围保留为区间，直到输出 domain 的有序设备列表。
+分配共享规范化的不可变覆盖快照；collective 消费者按源码顺序更新目标快照，缓存
+每对不同快照的并集。分组使用快照 ID，因此不会按消费者或分配数反复复制或比较
+相同的大集合。
 
-   每个位置参数若是已记录的 view Var，就向对应 alloc 追加该描述符。
+覆盖计算仍有复杂度例外：每个未缓存的 collective 并集需要 `O(I_left + I_right)`
+的区间处理以及有序规范化键比较；比较可能检查区间前缀。快照存储量为各快照区间数
+之和，输出设备列表的成本为成员总数。许多不同且相交的并集即使最终输出很小，
+仍可能相对 IR 大小产生二次工作量。按 pass-complexity 规则，该残余界限需要在
+合并前明确批准；这里不声称普遍满足 `O(N log N)`。不会反复扫描函数体求不动点，
+不会在每个调用点扫描全部形参，也不会为每次使用单独追溯别名链。已有 scope 保证
+重复运行幂等。
 
-4. **合并描述符**。对每个 alloc 折叠记录到的所有描述符：任何 `kAll` ⇒ `kAll`；
-   否则取 subset 并集。HOST 级 collective 的 signal（以及
-   `pld.tensor.all_to_all_v` 的 `recv_counts`）自身没有 `device=`，因此从
-   collective 配对的 data/target alloc 继承设备覆盖范围——一次调用可以注册
-   多个共享同一 data alloc 的配对（`all_to_all_v` 会注册两个：一个用于
-   `signal`，一个用于 `recv_counts`）。
+## 诊断与输出不变量
 
-5. **构造 `WindowBuffer`**。对每个 alloc 构造
-   `WindowBuffer(base = ptr_var, size = size_expr, load_from_host = false,
-   store_to_host = false)`；`Var::name_hint_` 自动继承自 `ptr_var->name_hint_`。
-   （host-staging 标志位是 N4+ 的占位字段。）
+- 缺少 view 和没有相邻 dispatch 消费者的分配保留已有诊断。不支持的覆盖表达式、
+  有歧义的身份，以及没有所有者 scope 的非空身份会被拒绝。
+- 每个物化 window 及其支持的别名、callee 形参、返回和投影都与所有者 scope slot
+  共享完全相同的 `WindowBuffer` 对象。独立 device 函数的可空形参仍可保持未绑定。
+- 一个 scope 只拥有其函数的本地 slot。继承的 slot 不会复制到子 scope。
+  函数遍历顺序不会选择调用者身份，也不会改变结果。
+- 赋值两侧类型保持对称；保留原 shape/view 元数据，使真实类型不匹配仍可由验证器发现。
+- [`SynthesizeAllReduceSignals`](46-synthesize_allreduce_signals.md) 之后，HOST
+  `allreduce` 仍带显式或合成 signal。HOST `all_to_all_v` 在 `for`/`while` 中的
+  现有限制保持不变。
 
-6. **改写 view 类型**（仅 host_orch）。对每个 view 绑定，mint 一个同
-   `name_hint_` 的新 `Var`，类型为
-   `DistributedTensorType(shape, dtype, memref, tensor_view, wb)`；用
-   `Substitute` 把所有对旧 view Var 的引用替换为新 Var。`Substitute` 只改写
-   *引用*，因此随后还要把定义每个新 Var 的 Call 按同一个带 `window_buffer_`
-   的类型重新 mint——否则该赋值语句结束时左值带回指、右值不带，违反
-   [`AssignTypeSymmetry`](99-verifier.md#built-in-rules)。重新 mint 只会*补上*
-   回指：仅当重建出的类型与 Var 的类型结构相等时才采用，真正的 shape / dtype /
-   view 分歧留给验证器报错。同一 alloc 被 N 次
-   `pld.tensor.window` 物化的多个 view 共享同一 `shared_ptr<const WindowBuffer>`。
-   chip-orch / InCore 形参类型不动。
-
-7. **聚类成 group**。按源代码顺序遍历 alloc 列表，匹配描述符已存在的
-   comm-domain scope 则追加 slot，否则新开一个。`CommDomainScopeStmt wrappers in each host_orch body` 最终
-   填充该列表。
-
-## Sanity 校验
-
-下列情况抛 `pypto::ValueError`（携带 alloc 的 span）：
-
-- 某 alloc 没有任何 `pld.tensor.window` 物化（dead alloc）。
-- 某 alloc 有 view 但没有 chip-orch dispatch 消费它。
-- dispatch 的 `device=` 既不是 `ConstInt`、也不是已识别的 `pl.range`
-  归纳变量。
-- 同一 comm-domain scope 内 `name_hint_` 重名（parser 已在程序范围内做了唯一性
-  校验，本 pass 再次断言）。
-- `pld.tensor.all_to_all_v` 调用位于 HOST orchestrator 的 `for`/`while`
-  循环内——动态重复调用需要循环携带的窗口生命周期管理，本编译器尚未建模
-  （信用式信号本身可跨顺序调用复用；与 `LowerCompositeOps` 在 InCore 路径上
-  强制的限制相同）。
-
-## 输出不变量
-
-pass 运行之后：
-
-- `CommDomainScopeStmt wrappers in each host_orch body` 已填（程序不分配 window buffer 时为空）。
-- 每个 `pld.tensor.window` 结果 Var 的类型是 `DistributedTensorType`，
-  `window_buffer_` 字段指向对应的 `WindowBuffer`；定义它的 Call 带同一个类型——
-  赋值两侧一致。
-- comm-domain 分析和 `LowerHostTensorCollectives` 看到的每个 host-level
-  `pld.tensor.allreduce` 都已经有两个位置参数（在
-  [`SynthesizeAllReduceSignals`](46-synthesize_allreduce_signals.md) 运行之后）。
-  用户省略 signal 时，第二个参数是前置
-  `pld.tensor.window` 赋值语句产生的合成 Var。
-- 同一 alloc 的多个 view 共享同一 `shared_ptr<const WindowBuffer>`——指针
-  相等是下游 codegen 的关键不变量。
-- chip-orchestration 与 InCore 的形参类型 `window_buffer_` 仍是 `nullopt`。
-  N7 codegen 在 *host_orch* 的 dispatch 处读取反向引用、再为 chip-orch 显式
-  下发对应的 `CommContext` 指针。
+这是有明确边界的通信域与身份阶段，不新增 CLUSTER_0 collective lowering，不改变
+context 物化，也不会启用完整 L4 `compile` 流水线；这些依赖后续 lowering/runtime 阶段。
 
 ## 文本 round-trip
 

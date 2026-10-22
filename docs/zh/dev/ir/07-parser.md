@@ -116,6 +116,27 @@ Shape 维度也通过表达式解析器恢复私有 `pl._dump.call(...)` 快照�
 | `pl._dump.logical_xor(x, y)` | BOOL `Xor`；`x ^ y` 则表示整数 `BitXor` |
 | `pl.const(pl._dump.float64("7ff0000000000000"), pl.FP32)` | 带显式 dtype 的正无穷 |
 | `pl._dump.WindowBuffer`, `pl._dump.Unknown` | 内部无字段类型标记 |
+| `pl._dump.window_buffer(key, base=..., size=...)` | 完整窗口描述符，包含可选的 HOST 暂存标志 |
+| `pl._dump.window_ref(key)` | 通过显式字符串或数字 ID 引用同一个窗口对象 |
+
+窗口 ID 仅在一次程序解析中有效。归属作用域
+`pl._dump.comm_domain(..., slots=[...])` 中的描述符可被整个程序的函数形参、
+函数体、声明返回类型及 Call/Submit 结果类型引用，不依赖函数定义顺序。
+解析器在归属作用域的函数体解析完成后，使用该函数的实际分配变量及局部
+大小表达式解析描述符，包括 `size = n * 4`。引用方保留自身的 shape、dtype、
+MemRef 和 tensor view；存储名称相同不会使不同函数共享分配身份。未知、冲突
+或未解析的 ID 会在返回程序前触发解析错误。
+
+手写类型注解中的完整描述符及独立函数解析继续受支持。HOST/CLUSTER
+SubWorker 的 Python 函数体保持不透明，其中外形类似描述符的 Python 调用
+不会定义 IR 窗口；其函数签名仍按 IR 元数据解析。
+
+延迟窗口引用在最后一次 native mutator 遍历中统一替换。解析器的私有辅助函数
+显式替换分布式类型的窗口反向引用；普通 `IRMutator` 的类型遍历保留这些引用，
+不会通过它们遍历其他函数的归属元数据。
+私有辅助函数还根据实际归属函数的 Var 身份重新绑定描述符大小表达式，
+包括标量通信上下文查询所使用的传入张量。全部类型引用及归属槽位共享
+最终的同一个窗口对象。循环替换链或窗口大小依赖环会触发明确诊断。
 
 `pl.Ptr` 继续表示 `PtrType`，包括签名中的使用。内部 marker 的 round-trip
 不代表任意内部签名都可降低为可执行 kernel。Unknown 仍是类型推断占位符；
