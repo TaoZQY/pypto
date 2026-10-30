@@ -285,10 +285,20 @@ std::string DistributedCodegen::GenerateImpl(const ir::ProgramPtr& program, bool
           embedded_prepared_tensors_[SanitizeName(assign->var_->name_hint_)] = tensor;
         }
       }
-      EmitAllocIntermediatesFunction(best_orch);
-      host_orch_body_after_hoist_ = true;
-      EmitFunction(best_orch);
-      host_orch_body_after_hoist_ = false;
+      if (IsClusterLevel(best_orch)) {
+        // Remote buffer control must finish before any task is submitted.
+        // Collect the implicit return-target names while emitting the native
+        // root, then materialize them in its separate storage allocator.
+        host_orch_body_after_hoist_ = true;
+        EmitFunction(best_orch);
+        host_orch_body_after_hoist_ = false;
+        EmitAllocIntermediatesFunction(best_orch);
+      } else {
+        EmitAllocIntermediatesFunction(best_orch);
+        host_orch_body_after_hoist_ = true;
+        EmitFunction(best_orch);
+        host_orch_body_after_hoist_ = false;
+      }
       hoisted_allocs_.clear();
     } else {
       EmitFunction(best_orch);
@@ -1897,7 +1907,7 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
       const std::string base = target.empty() ? ta_var + "_return" : target;
       const std::string name = plan.size() == 1 && !submit ? base : base + "_ret_" + std::to_string(i);
       return_tensors[i] = name;
-      if (embedded_mode_) {
+      if (embedded_mode_ || is_cluster) {
         EmbeddedStaticShape(tensor, call->span_);
         embedded_prepared_tensors_[name] = tensor;
       } else {
@@ -2329,20 +2339,28 @@ void DistributedCodegen::EmitAllocIntermediatesFunction(const ir::FunctionPtr& h
                       "for _ in range(max(world_size, 1))]");
   }
 
-  if (hoisted_allocs_.empty() && comm_scopes.empty()) {
+  if (hoisted_allocs_.empty() && comm_scopes.empty() && (!is_cluster || embedded_prepared_tensors_.empty())) {
     emitter_.EmitLine("pass");
   } else if (!hoisted_allocs_.empty()) {
     // Walk top-level statements in original order; emit only hoisted allocs.
     // Falls through the normal AssignStmt → Call → EmitTensorCreate path.
     // host_orch_body_after_hoist_ is FALSE here so EmitTensorCreate runs
-    // unchanged. The subsequent EmitFunction(host_orch) call resets visitor
-    // state (declared_vars_, current_func_, ...), so no save/restore needed.
+    // unchanged. HOST emits this helper before its entry; CLUSTER emits it
+    // after collecting all return-target storage names from the native root.
     current_func_ = host_orch;
     for (const auto& stmt : TopLevelStmts(UnwrapLeadingCommDomainScopes(host_orch->body_))) {
       auto assign = std::dynamic_pointer_cast<const ir::AssignStmt>(stmt);
       if (assign && hoisted_allocs_.count(assign.get())) {
         VisitStmt(stmt);
       }
+    }
+  }
+  if (is_cluster) {
+    for (const auto& [name, tensor] : embedded_prepared_tensors_) {
+      emitter_.EmitLine("if \"" + name + "\" not in tensors:");
+      emitter_.EmitLine("    tensors[\"" + name + "\"] = torch.zeros(" +
+                        EmbeddedStaticShape(tensor, host_orch->span_) + ", dtype=torch." +
+                        DataTypeToPythonDType(tensor->dtype_) + ").share_memory_()");
     }
   }
   emitter_.DecreaseIndent();

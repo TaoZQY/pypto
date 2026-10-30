@@ -66,6 +66,7 @@ _CLUSTER_META_SCHEMA = 4
 
 if TYPE_CHECKING:
     from pypto.runtime._artifact_runtime import ArtifactRuntime
+    from pypto.runtime.cluster_runner import ClusterWorker
     from pypto.runtime.distributed_runner import DistributedWorker, ReadOnlyHostTensor
     from pypto.runtime.runner import RunConfig
 
@@ -102,7 +103,7 @@ class ClusterNodeSpec:
 
 @dataclass
 class ClusterConfig:
-    """Validated launch settings for future POD/CLUSTER_0 execution.
+    """Validated launch settings for POD/CLUSTER_0 execution.
 
     Each node entry owns an ordered group of devices. Global device ranks are
     contiguous in node declaration order, then device-list order. MPI entry
@@ -111,7 +112,7 @@ class ClusterConfig:
 
     The launcher and Python executable are explicit strings; this configuration
     performs no discovery or network operations. CLUSTER_0 compilation captures
-    recursive artifacts; execution remains gated until runner integration.
+    recursive artifacts; preparation launches its dedicated cluster runner.
     """
 
     nodes: list[ClusterNodeSpec]
@@ -739,7 +740,8 @@ class DistributedCompiledProgram:
     def _require_supported_execution(self) -> None:
         if self._entry_kind == "cluster":
             raise NotImplementedError(
-                "Cluster/POD (L4) execution is unsupported until cluster runner integration"
+                "Cluster/POD (L4) execution is unsupported by this HOST executor; "
+                "use compiled.prepare() to construct its ClusterWorker"
             )
 
     @property
@@ -810,6 +812,9 @@ class DistributedCompiledProgram:
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
         """Execute the distributed program via simpler Worker(level=3).
 
+        CLUSTER_0 entries instead use a one-shot :class:`ClusterWorker` session,
+        with ordinary contiguous CPU Tensor and Scalar arguments.
+
         ``config`` is an optional per-dispatch :class:`RunConfig`; its per-task
         ring-sizing overrides (``ring_task_window`` / ``ring_heap`` /
         ``ring_dep_pool``) size this dispatch's runtime ring buffers, and its
@@ -828,6 +833,9 @@ class DistributedCompiledProgram:
         live Worker; use :meth:`prepare`, allocate it through the returned
         ``DistributedWorker``, then call ``worker.run(...)``.
         """
+        if self._entry_kind == "cluster":
+            with self.prepare() as worker:
+                return worker(*args, config=config)
         self._require_supported_execution()
         from pypto.runtime.distributed_runner import _execute_distributed  # noqa: PLC0415
 
@@ -887,8 +895,13 @@ class DistributedCompiledProgram:
         sub_worker_overrides: dict[str, Callable[..., Any]] | None = None,
         inherited_host_tensors: "Sequence[torch.Tensor | ReadOnlyHostTensor] | None" = None,
         startup_timeout_s: float | None = None,
-    ) -> "DistributedWorker":
+    ) -> "DistributedWorker | ClusterWorker":
         """Prepare a reusable L3 execution handle (setup once, dispatch many).
+
+        CLUSTER_0 entries return :class:`ClusterWorker`, whose synchronous
+        ``run`` accepts ordinary contiguous CPU tensors allocated after this
+        call. Global windows, callback overrides, inherited host buffers,
+        persistent mode and ``extra_compiled`` are currently unsupported there.
 
         Runs the expensive setup (``_compile_and_assemble``, generated-module
         loading, simpler ``Worker(level=3)`` construction + registration +
@@ -964,6 +977,22 @@ class DistributedCompiledProgram:
             A :class:`DistributedWorker`; use it as a context manager or call
             ``close()`` when done.
         """
+        if self._entry_kind == "cluster":
+            self._require_artifact_ready()
+            if (
+                persistent
+                or reset_persistent_windows is not None
+                or callbacks
+                or sub_worker_overrides
+                or inherited_host_tensors
+            ):
+                raise NotImplementedError(
+                    "ClusterWorker currently supports synchronous ordinary Tensor/Scalar execution; "
+                    "persistent windows, callback overrides and inherited host buffers are unsupported"
+                )
+            from pypto.runtime.cluster_runner import ClusterWorker  # noqa: PLC0415
+
+            return ClusterWorker([self, *extra_compiled], config, startup_timeout_s=startup_timeout_s)
         self._require_supported_execution()
         for compiled in extra_compiled:
             compiled._require_supported_execution()

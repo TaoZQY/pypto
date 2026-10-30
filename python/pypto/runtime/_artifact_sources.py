@@ -258,6 +258,13 @@ def build_cluster_source_bundle(directory: Path) -> tuple[str, bytes]:
         "orchestration/_distributed_support.py",
         "next_levels/__init__.py",
     }
+    bootstrap_path = "orchestration/cluster_bootstrap.py"
+    # Bootstrap is a canonical runtime-only source, owned by the producer
+    # rather than a mutable artifact file. Its bytes participate in the digest.
+    bootstrap = _read_cluster_source(
+        Path(__file__).parent, "cluster_bootstrap.py", _CLUSTER_MAX_UNPACKED_BYTES - len(metadata)
+    )
+    paths.add(bootstrap_path)
     for entry in closure["entries"]:
         prefix = entry["logical_path"]
         source_path = f"{prefix}/orchestration/host_orch.py"
@@ -269,9 +276,9 @@ def build_cluster_source_bundle(directory: Path) -> tuple[str, bytes]:
             if (directory / required).exists():
                 paths.add(required)
     _check_cluster_member_paths(paths | {"bundle_manifest.json"})
-    payloads = {"distributed_meta.json": metadata}
-    total = len(metadata)
-    for path in sorted(paths - {"distributed_meta.json"}):
+    payloads = {"distributed_meta.json": metadata, bootstrap_path: bootstrap}
+    total = len(metadata) + len(bootstrap)
+    for path in sorted(paths - {"distributed_meta.json", bootstrap_path}):
         data = _read_cluster_source(directory, path, _CLUSTER_MAX_UNPACKED_BYTES - total)
         payloads[path] = data
         total += len(data)

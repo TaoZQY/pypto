@@ -58,10 +58,25 @@ schema 4。显式集群配置覆盖必须等于保存的快照；更换设备分
 schema 4 元数据仅支持 CLUSTER_0；直接构建 CLUSTER_1、CLUSTER_2 或 GLOBAL 包装器时，
 会在修改任何产物前明确报告该入口尚未支持。
 
-集群恢复仅重建元数据，不运行 pass、codegen 或 `kernel_config.py`。在集群 codegen 和
-runner 完成前，完整 L4 编译、二进制晋级/加载及执行仍未支持。包装器、HOST Worker 和
-prebuilt 适配器会在 HOST 回退或编译器启动前拒绝 L4。本阶段不定义递归 CHIP 清单，
-也不预设最终集群 wire ABI。
+集群恢复仅重建元数据，不运行 pass、codegen 或 `kernel_config.py`。schema 4 保存递归
+声明的 HOST 入口、不可变原生 wire 布局及相对产物根目录的完整 CHIP 路径。
+CLUSTER_0 的 `compiled.prepare()` 返回同步 `ClusterWorker`；`compiled(*args)` 使用
+一次性会话。原有 HOST Worker API 保持独立，并继续拒绝集群产物。
+
+父进程编译或加载全部声明的 CHIP 依赖，在 L4 运行时注册。确定性的纯源码 gzip/USTAR
+包包含生成的入口、SUB 函数、共享支持代码和 `cluster_bootstrap.py`。由摘要派生的安装
+包名前缀位于归档字节之外。每个 MPI rank 安装并激活源码、解析本地 CHIP handle、绑定
+原生 HOST 入口，并在内部 Worker 初始化前分配静态共享存储。rank 源码不导入 PyPTO、
+编译器或 `kernel_config.py`。
+
+执行接受普通连续 CPU Tensor（也允许在 `prepare()` 后分配）及 Scalar。所有 rank，
+包括同主机 rank 0，均使用远程分配及拷贝；保留基于存储偏移的连续视图与别名。完整
+DAG 成功后，所有 rank 的输出统一回拷，随后才释放远程分配；DAG 失败则关闭层级，不发布
+部分输出。关闭失败时保留调用存储与参数帧，拒绝继续执行，并允许重试关闭。父进程加载
+源码时不会在不可变产物内创建字节码缓存。跨节点重叠的普通读写或写写范围需要显式转发，
+目前明确拒绝。全局窗口、异步
+提交、运行时 callback 覆盖及多程序 `extra_compiled` 会话同样报告尚未支持。上述限制
+不改变 schema 3 的 HOST 执行及其 callback 行为。
 
 `pypto._artifact_contract` 中的 `ExecutionCapabilities` 是经过校验的不可变记录；
 `CompiledProgram`、其 orchestration 子对象和 `DistributedCompiledProgram`

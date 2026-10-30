@@ -76,11 +76,33 @@ Schema-4 metadata is limited to CLUSTER_0; constructing a CLUSTER_1, CLUSTER_2 o
 GLOBAL wrapper raises an unsupported-entry diagnostic before mutating artifacts.
 
 Cluster restoration is metadata-only: it runs no passes, codegen or
-`kernel_config.py`. Full L4 compilation, binary promotion/loading and execution
-remain unsupported until cluster codegen and runner integration exist. The
-wrapper, HOST worker and prebuilt adapter reject L4 before HOST fallback or
-compiler startup. This milestone defines neither recursive CHIP inventory nor
-the final cluster wire ABI.
+`kernel_config.py`. Schema 4 captures the recursively declared HOST entries,
+their immutable native wire layouts and full root-relative CHIP paths.
+`compiled.prepare()` returns a synchronous `ClusterWorker` for CLUSTER_0;
+`compiled(*args)` uses a one-shot session. The existing HOST worker API remains
+separate and rejects cluster artifacts.
+
+The parent compiles or loads every declared CHIP dependency and registers it
+with the L4 runtime. A deterministic source-only gzip/USTAR bundle carries
+the generated roots, SUB functions, shared support and `cluster_bootstrap.py`.
+The digest-derived installed package prefix is external to the archive bytes.
+Every MPI rank installs/activates these sources, resolves its local CHIP handles,
+binds native HOST entries and allocates static shared storage before inner-worker
+initialization. Rank sources import no PyPTO, compiler or `kernel_config.py`.
+
+Runs accept ordinary contiguous CPU tensors, including tensors allocated after
+`prepare()`, plus scalar arguments. Every rank, including a local rank zero,
+uses remote allocations/copies. Storage-relative contiguous views and aliases
+are preserved. Outputs copy back after the complete DAG succeeds, on all ranks,
+before any remote allocation is freed. Failed DAGs close the hierarchy without
+publishing partial outputs. An unsuccessful close retains invocation storage
+and argument frames, refuses further dispatch, and permits retrying close.
+Parent source loading creates no bytecode cache inside the immutable artifact.
+Cross-node overlapping ordinary write/read or
+write/write ranges are unsupported because they require explicit forwarding.
+Global windows, asynchronous submission, runtime callback overrides and
+multi-program `extra_compiled` sessions report an unsupported-operation error.
+These restrictions do not change HOST schema-3 execution or its callbacks.
 
 `ExecutionCapabilities` in `pypto._artifact_contract` is immutable and validated;
 `CompiledProgram`, its orchestration children, and `DistributedCompiledProgram`

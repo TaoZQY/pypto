@@ -11,6 +11,7 @@
 
 import ast
 import copy
+import ctypes
 import gzip
 import hashlib
 import importlib
@@ -21,9 +22,11 @@ import re
 import subprocess
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pypto.language as pl
 import pytest
+import torch
 from pypto import backend, codegen, ir
 from pypto.backend import BackendType, pto_backend
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
@@ -202,10 +205,10 @@ def test_c3c_cold_restore_does_not_import_entries_or_reconstruct_program(cluster
     assert restored.program is None and restored.entry_kind == "cluster"
     assert restored.entry_name == "root" and restored.cluster_config == _config()
     assert json.loads((root / "distributed_meta.json").read_text()) == metadata
+    # A restored cluster can use its dedicated runner, while the legacy HOST
+    # execution seam still refuses to consume schema-4 entries.
     with pytest.raises(NotImplementedError, match=r"(?i)(cluster|POD|L4).*(execution|runner|support)"):
-        restored.prepare()
-    with pytest.raises(NotImplementedError, match=r"(?i)(cluster|POD|L4).*(execution|runner|support)"):
-        restored()
+        restored._require_supported_execution()
 
 
 @pytest.mark.parametrize(
@@ -443,7 +446,7 @@ def test_c3c_installed_sources_import_in_arbitrary_digest_namespace_without_pypt
     assert "C3C_RUNTIME_SOURCES_PASS" in result.stdout
 
 
-def test_c3c_full_compile_generates_artifact_but_execution_remains_gated(tmp_path):
+def test_c3c_full_compile_routes_cluster_to_dedicated_runner(tmp_path, monkeypatch):
     # Exercise the public compile entry and actual pass/codegen path, rather
     # than bypassing the guard or replacing pipeline output with a fake program.
     program = _program(lower=False)
@@ -453,8 +456,17 @@ def test_c3c_full_compile_generates_artifact_but_execution_remains_gated(tmp_pat
     assert compiled.entry_kind == "cluster"
     metadata = json.loads((compiled.output_dir / "distributed_meta.json").read_text())
     assert len(metadata["l3_entries"]["entries"]) == 2
-    with pytest.raises(NotImplementedError, match=r"(?i)(cluster|POD|L4).*(execution|runner|support)"):
-        compiled.prepare()
+    runner = importlib.import_module("pypto.runtime.cluster_runner")
+    calls = []
+    sentinel = object()
+
+    def prepare(programs, config, **kwargs):
+        calls.append(programs)
+        return sentinel
+
+    monkeypatch.setattr(runner, "ClusterWorker", prepare)
+    assert compiled.prepare() is sentinel
+    assert calls == [[compiled]]
 
 
 @pytest.mark.parametrize("level", [ir.Level.CLUSTER_1, ir.Level.CLUSTER_2, ir.Level.GLOBAL])
@@ -522,6 +534,447 @@ def test_c3c_source_bundle_rejects_receiver_path_aliases(cluster_program, tmp_pa
     _emit(program, root)
     with pytest.raises(ValueError, match=r"(?i)(reserved|unsafe|alias|casefold)"):
         _artifact_sources.build_cluster_source_bundle(root)
+
+
+@pytest.fixture
+def cluster_runner_harness(cluster_artifact, monkeypatch):
+    """Keep native generated root/metadata and replace only remote process/device I/O."""
+    runner = importlib.import_module("pypto.runtime.cluster_runner")
+    from simpler.callable_identity import CallableHandle  # noqa: PLC0415
+    from simpler.task_interface import RemoteAddressSpace, RemoteBufferHandle  # noqa: PLC0415
+    from simpler.worker import RemoteCallable  # noqa: PLC0415
+
+    root, compiled, _, metadata = cluster_artifact
+    events, registrations, tasks = [], [], []
+    chips = {
+        path: object() for entry in metadata["l3_entries"]["entries"] for path in entry["chip_paths"].values()
+    }
+    state = SimpleNamespace(events=events, registrations=registrations, tasks=tasks, fail=False)
+
+    class Worker:
+        def __init__(self, *, level, **kwargs):
+            assert level == 4
+            self.memory = {}
+            self.in_graph = False
+            state.worker = self
+
+        def register(self, target, *, workers=None):
+            registrations.append((target, workers))
+            remote = isinstance(target, RemoteCallable)
+            return CallableHandle(
+                "sha256:" + hashlib.sha256(str(len(registrations)).encode()).hexdigest(),
+                "PYTHON_IMPORT" if remote else "CHIP_CALLABLE",
+                "REMOTE_TASK_DISPATCHER" if remote else "LOCAL_CHIP",
+            )
+
+        def add_mpirun_worker_group(self, spec):
+            state.spec = spec
+            return (7, 13)
+
+        def init(self, **kwargs):
+            events.append("ready")
+
+        def remote_malloc(self, *, worker, nbytes):
+            assert not self.in_graph, "Remote allocation must precede graph submission"
+            handle = RemoteBufferHandle._from_remote_allocation(
+                worker_id=worker,
+                buffer_id=len(self.memory) + 1,
+                generation=1,
+                address_space=RemoteAddressSpace.REMOTE_DEVICE,
+                nbytes=nbytes,
+            )
+            self.memory[handle] = bytearray(nbytes)
+            events.append(("malloc", worker))
+            return handle
+
+        def remote_copy_to(self, handle, ptr, nbytes, *, offset=0):
+            assert not self.in_graph, "Remote upload must precede graph submission"
+            events.append(("upload", handle.worker_id))
+            self.memory[handle][offset : offset + nbytes] = ctypes.string_at(ptr, nbytes)
+
+        def remote_copy_from(self, handle, ptr, nbytes, *, offset=0):
+            events.append(("copyback", handle.worker_id))
+            ctypes.memmove(ptr, bytes(self.memory[handle][offset : offset + nbytes]), nbytes)
+
+        def remote_free(self, handle):
+            events.append(("free", handle.worker_id))
+            del self.memory[handle]
+            handle._mark_released()
+
+        def run(self, fn, args=None, config=None):
+            def submit(handle, args, config, *, worker):
+                tasks.append((handle, args, worker))
+
+            self.in_graph = True
+            try:
+                fn(SimpleNamespace(submit_next_level=submit), args, config)
+            finally:
+                self.in_graph = False
+            if state.fail:
+                events.append("failed")
+                raise RuntimeError("remote DAG failed")
+            events.append("drained")
+
+        def close(self):
+            events.append("closed")
+            self.memory.clear()
+
+    monkeypatch.setattr(runner, "Worker", Worker)
+    monkeypatch.setattr(
+        runner,
+        "_assemble_cluster_chips",
+        lambda compiled: {path: (chip, compiled.cluster_config.runtime, {}) for path, chip in chips.items()},
+    )
+    # C3c's metadata fixture intentionally uses the real A3 fabric profile.
+    # The process/device boundary is replaced here, so select its matching
+    # real platform rather than weakening MpiL3GroupSpec's profile validation.
+    state.compiled = ir.DistributedCompiledProgram.from_dir(root, platform="a2a3")
+    state.chips = chips
+    return runner, state
+
+
+def test_i0_cluster_implicit_return_storage_is_preallocated_before_graph(cluster_artifact):
+    root, compiled, files, metadata = cluster_artifact
+    module = {}
+    exec(compile(files["orchestration/cluster_orch.py"], "cluster_orch.py", "exec"), module)
+    tensors = {"x": torch.ones(8), "count": 2, "left": torch.zeros(8), "right": torch.zeros(8)}
+    originals = {
+        value.untyped_storage().data_ptr() for value in tensors.values() if isinstance(value, torch.Tensor)
+    }
+    module["_alloc_intermediates"](tensors, nodes=[7, 13])
+    implicit = [
+        value
+        for value in tensors.values()
+        if isinstance(value, torch.Tensor) and value.untyped_storage().data_ptr() not in originals
+    ]
+    assert len(implicit) == 1, "Native CLUSTER allocator must materialize its implicit HOST return slot"
+    assert implicit[0].shape == (8,) and implicit[0].dtype == torch.float32 and implicit[0].is_shared()
+    body = ast.parse(files["orchestration/cluster_orch.py"])
+    entry = next(node for node in body.body if isinstance(node, ast.FunctionDef) and node.name == "root")
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "torch"
+        and node.func.attr in {"zeros", "empty", "ones", "full"}
+        for node in ast.walk(entry)
+    ), "Generated CLUSTER graph must not allocate storage after remote control staging"
+
+
+def test_i0_cluster_public_prepare_uses_native_root_and_all_rank_remote_buffers(cluster_runner_harness):
+    runner, state = cluster_runner_harness
+    compiled = state.compiled
+    assert compiled.program is None
+    x, left, right = torch.arange(8, dtype=torch.float32), torch.zeros(8), torch.zeros(8)
+    assert not list(compiled.output_dir.rglob("__pycache__"))
+    with compiled.prepare() as worker:
+        assert not list(compiled.output_dir.rglob("__pycache__")), (
+            "Loading a cluster root must not write bytecode inside an immutable artifact"
+        )
+        assert isinstance(worker, runner.ClusterWorker)
+        for _ in range(2):
+            worker.run(compiled, x, -7, left, right)
+        assert not state.worker.memory
+    assert [task[2] for task in state.tasks] == [7, 13, 7, 13]
+    assert [task[1].tensor_count() for task in state.tasks] == [3, 2, 3, 2]
+    assert all(task[1].scalar_count() == 1 for task in state.tasks)
+    assert state.spec.hosts == ("node-a", "node-b")
+    assert len(state.spec.startup_hooks_by_rank) == 2
+    assert len(state.registrations) == 4
+    assert all(workers == [7, 13] for _, workers in state.registrations[2:])
+    assert {event[1] for event in state.events if isinstance(event, tuple) and event[0] == "malloc"} == {
+        7,
+        13,
+    }
+    for index, event in enumerate(state.events):
+        if isinstance(event, tuple) and event[0] == "copyback":
+            assert "drained" in state.events[:index]
+    assert state.events.index(("copyback", 13)) < state.events.index(("free", 7))
+
+
+def test_i0_failure_never_copies_partial_outputs_and_frees_after_teardown(cluster_runner_harness):
+    _, state = cluster_runner_harness
+    state.fail = True
+    with state.compiled.prepare() as worker:
+        with pytest.raises(RuntimeError, match="remote DAG failed"):
+            worker(torch.ones(8), 2, torch.zeros(8), torch.zeros(8))
+    assert not any(isinstance(event, tuple) and event[0] == "copyback" for event in state.events)
+    assert not state.worker.memory
+
+
+def test_i0_failed_close_retains_invocation_frames_until_safe_teardown(cluster_runner_harness, monkeypatch):
+    _, state = cluster_runner_harness
+    worker = state.compiled.prepare()
+    original_close = state.worker.close
+    state.fail = True
+
+    def fail_close():
+        raise RuntimeError("hierarchy close failed")
+
+    monkeypatch.setattr(state.worker, "close", fail_close)
+    try:
+        with pytest.raises(RuntimeError, match="hierarchy close failed"):
+            worker(torch.ones(8), 2, torch.zeros(8), torch.zeros(8))
+        assert worker._active_io is not None and worker._active_io.storages
+        assert worker._keep, "An unconfirmed hierarchy close must retain submitted TaskArgs frames"
+        assert not any(isinstance(event, tuple) and event[0] == "copyback" for event in state.events)
+        previous_io, previous_frames = worker._active_io, tuple(worker._keep)
+        before_retry = list(state.events)
+        with pytest.raises(RuntimeError, match=r"(?i)(previous|pending|close)"):
+            worker(torch.ones(8), 2, torch.zeros(8), torch.zeros(8))
+        assert worker._active_io is previous_io, (
+            "A new run must not replace an unconfirmed invocation journal"
+        )
+        assert tuple(worker._keep) == previous_frames
+        assert state.events == before_retry, "Unsafe admission must fail before additional remote I/O"
+    finally:
+        monkeypatch.setattr(state.worker, "close", original_close)
+        worker.close()
+    assert worker._active_io is None and worker._keep == []
+    assert not state.worker.memory
+
+
+def test_i0_scalar_only_failed_close_retains_frames_without_storage(
+    cluster_runner_harness, monkeypatch, tmp_path
+):
+    runner, state = cluster_runner_harness
+
+    @pl.program
+    class ScalarEntries:
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def node(self, count: pl.Scalar[pl.INT32]):
+            return 0
+
+        @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+        def root(self, count: pl.Scalar[pl.INT32]):
+            self.node(count, worker=0)
+            return 0
+
+    compiled = ir.compile(
+        ScalarEntries,
+        output_dir=str(tmp_path / "scalar-only"),
+        skip_ptoas=True,
+        cluster_config=_config(),
+        platform="a2a3",
+    )
+    assert compiled._get_metadata()[0][0].shape is None
+    assert not compiled.l3_entries["entries"][0]["layout"]["tensor_slots"]
+    monkeypatch.setattr(runner, "_assemble_cluster_chips", lambda compiled: {})
+    worker = compiled.prepare()
+    original_close = state.worker.close
+    state.fail = True
+
+    def fail_close():
+        raise RuntimeError("hierarchy close failed")
+
+    monkeypatch.setattr(state.worker, "close", fail_close)
+    try:
+        with pytest.raises(RuntimeError, match="hierarchy close failed"):
+            worker(3)
+        assert worker._active_io is not None, "No storage is not proof that the accepted graph drained"
+        assert worker._active_io.storages == {}
+        assert worker._keep, "Scalar-only TaskArgs frames must survive an unconfirmed hierarchy close"
+        previous_io, previous_frames = worker._active_io, tuple(worker._keep)
+        before_retry = list(state.events)
+        with pytest.raises(RuntimeError, match=r"(?i)(previous|pending|close)"):
+            worker(4)
+        assert worker._active_io is previous_io and tuple(worker._keep) == previous_frames
+        assert state.events == before_retry
+    finally:
+        monkeypatch.setattr(state.worker, "close", original_close)
+        worker.close()
+    assert worker._active_io is None and worker._keep == []
+
+
+def test_i0_contiguous_offset_aliases_share_remote_storage_and_cross_node_writes_fail(cluster_runner_harness):
+    _, state = cluster_runner_harness
+    with state.compiled.prepare() as worker:
+        backing = torch.arange(16, dtype=torch.float32)
+        view = backing[4:12]
+        worker(view, 2, torch.zeros(8), torch.zeros(8))
+        # One tensor may be read on two nodes. A write followed by a peer read
+        # requires explicit transfer/fences, unavailable in ordinary I/O.
+        with pytest.raises(NotImplementedError, match=r"(?i)(cross.node|forward|ordinary)"):
+            worker(view, 2, view, torch.zeros(8))
+        with pytest.raises(ValueError, match=r"(?i)contiguous"):
+            worker(backing[::2], 2, torch.zeros(8), torch.zeros(8))
+
+
+_BOOTSTRAP_PROOF = (
+    _RUNTIME_IMPORT_PROOF.split("helper = importlib.import_module", 1)[0]
+    + r"""
+from types import SimpleNamespace
+import json
+import torch
+from simpler.startup_preparation import NodeStartupContext
+from simpler.task_interface import CallConfig, TaskArgs, TensorArgType
+bootstrap = importlib.import_module(namespace + '.orchestration.cluster_bootstrap')
+metadata = json.loads((installed[0].root / 'distributed_meta.json').read_text())
+records = metadata['l3_entries']['entries']
+paths = {path for entry in records for path in entry['chip_paths'].values()}
+digests = {path: str(index + 1).zfill(64) for index, path in enumerate(sorted(paths))}
+local_handles = {digest: object() for digest in digests.values()}
+registered = []
+class Worker:
+    def register(self, function):
+        registered.append(function)
+        return object()
+context = NodeStartupContext(
+    rank=0, artifact_roots={digest: installed[0].root}, inner_worker=Worker(),
+    chip_handles=local_handles,
+    parameters={'module_prefix': namespace, 'entries': records, 'chip_digests': digests,
+                'chip_configs': {path: {} for path in paths}},
+)
+state = bootstrap.prepare_node(context)
+try:
+    assert len(registered) == 2  # concrete observe SUB and return-copy SUB
+    calls = []
+    orch = SimpleNamespace(_worker=object(), submit_sub=lambda *a, **k: None,
+                           submit_next_level=lambda *a, **k: calls.append((a, k)))
+    from simpler.buffer import create_host_shared_buffer, mint_owner_instance_id
+    from simpler.task_interface import DataType
+    owner = mint_owner_instance_id()
+    buffers = [create_host_shared_buffer(32, owner, index + 1) for index in range(3)]
+    try:
+        for record in records:
+            module = importlib.import_module(namespace + '.' + record['module'])
+            entry = getattr(module, record['qualname'])
+            binding = entry._pypto_embedded_state
+            assert binding.callables['chip'] is local_handles[digests[record['chip_paths']['chip']]]
+            assert binding.callables.host_tensor_indices['chip'] == frozenset()
+            args = TaskArgs()
+            for index in range(2 + len(record['layout']['implicit_outputs'])):
+                args.add_tensor(buffers[index].tensor(shapes=(8,), dtype=DataType.FLOAT32),
+                                TensorArgType.INPUT if index == 0 else TensorArgType.OUTPUT_EXISTING)
+            args.add_scalar(-7)
+            for repeat in range(3):
+                entry(orch, args, CallConfig())
+                assert binding._frame is not None
+                try:
+                    entry(orch, args, CallConfig())
+                    raise AssertionError('Premature entry reuse accepted')
+                except RuntimeError as error:
+                    assert 'completion' in str(error)
+                state.task_completed()
+                assert binding._frame is None
+    finally:
+        for backing in buffers:
+            backing.close()
+finally:
+    state.close()
+assert not guard.attempts
+print('I0_BOOTSTRAP_PASS')
+"""
+)
+
+
+_CPU_BOOTSTRAP_PROOF = (
+    _RUNTIME_IMPORT_PROOF.split("helper = importlib.import_module", 1)[0]
+    + r"""
+import json
+from simpler.startup_preparation import NodeStartupContext
+from simpler.buffer import create_host_shared_buffer, mint_owner_instance_id
+from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
+from simpler.worker import Worker
+records = json.loads((installed[0].root / 'distributed_meta.json').read_text())['l3_entries']['entries']
+bootstrap = importlib.import_module(namespace + '.orchestration.cluster_bootstrap')
+worker = Worker(level=3, num_sub_workers=4)
+state = None
+owner = mint_owner_instance_id()
+buffers = [create_host_shared_buffer(32, owner, index + 1) for index in range(2)]
+try:
+    state = bootstrap.prepare_node(NodeStartupContext(
+        rank=0, artifact_roots={digest: installed[0].root}, inner_worker=worker, chip_handles={},
+        parameters={'module_prefix': namespace, 'entries': records, 'chip_digests': {}, 'chip_configs': {}},
+    ))
+    worker.init()
+    buffers[0].shm.buf[:] = bytes(range(32))
+    source, destination = [b.tensor(shapes=(8,), dtype=DataType.FLOAT32) for b in buffers]
+    for record in records:
+        entry = getattr(importlib.import_module(namespace + '.' + record['module']), record['qualname'])
+        args = TaskArgs()
+        args.add_tensor(source, TensorArgType.INPUT)
+        args.add_tensor(destination, TensorArgType.OUTPUT_EXISTING)
+        for repeat in range(3):
+            buffers[1].shm.buf[:] = bytes(32)
+            worker.run(entry, args, CallConfig())
+            assert entry._pypto_embedded_state._frame is not None
+            state.task_completed()
+            assert entry._pypto_embedded_state._frame is None
+            assert bytes(buffers[1].shm.buf) == bytes(buffers[0].shm.buf)
+finally:
+    worker.close()
+    if state is not None:
+        state.close()
+    for backing in buffers:
+        backing.close()
+assert not guard.attempts
+print('I0_BOOTSTRAP_PASS')
+"""
+)
+
+
+@pytest.mark.parametrize("real_cpu", [False, True])
+def test_i0_bundle_bootstrap_binds_native_entries_without_pypto(cluster_artifact, tmp_path, real_cpu):
+    runtime_python = os.environ.get("L4_RUNTIME_ONLY_PYTHON")
+    runtime_pythonpath = os.environ.get("L4_RUNTIME_ONLY_PYTHONPATH")
+    if not runtime_python or not runtime_pythonpath:
+        pytest.skip("Set L4_RUNTIME_ONLY_PYTHON and L4_RUNTIME_ONLY_PYTHONPATH")
+    root, _, _, _ = cluster_artifact
+    if real_cpu:
+
+        @pl.program
+        class CpuEntries:
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def observe(x: pl.Tensor[[8], pl.FP32]):
+                assert x.numel() == 8
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def first(self, x: pl.Tensor[[8], pl.FP32]) -> pl.Tensor[[8], pl.FP32]:
+                self.observe(x)
+                return x
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def second(self, x: pl.Tensor[[8], pl.FP32]) -> pl.Tensor[[8], pl.FP32]:
+                self.observe(x)
+                return x
+
+            @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+            def root(self, x: pl.Tensor[[8], pl.FP32]):
+                self.first(x, worker=0)
+                self.second(x, worker=1)
+                return 0
+
+        # Full public compilation proves serialization/codegen premises before
+        # the optional runtime-only child exercises actual CPU SUB completion.
+        compiled = ir.compile(
+            CpuEntries, output_dir=str(tmp_path / "cpu"), skip_ptoas=True, cluster_config=_config()
+        )
+        root = compiled.output_dir
+    digest, payload = _artifact_sources.build_cluster_source_bundle(root)
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+        assert "orchestration/cluster_bootstrap.py" in archive.getnames()
+    archive = tmp_path / "startup.tar.gz"
+    archive.write_bytes(payload)
+    result = subprocess.run(
+        [
+            runtime_python,
+            "-c",
+            _CPU_BOOTSTRAP_PROOF if real_cpu else _BOOTSTRAP_PROOF,
+            "installed_" + digest,
+            digest,
+            str(archive),
+            str(tmp_path / "installed"),
+        ],
+        cwd=tmp_path,
+        env=os.environ | {"PYTHONPATH": runtime_pythonpath, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "I0_BOOTSTRAP_PASS" in result.stdout
 
 
 if __name__ == "__main__":
