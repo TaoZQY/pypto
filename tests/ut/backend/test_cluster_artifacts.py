@@ -977,5 +977,376 @@ def test_i0_bundle_bootstrap_binds_native_entries_without_pypto(cluster_artifact
     assert "I0_BOOTSTRAP_PASS" in result.stdout
 
 
+@pytest.fixture
+def i1_global_artifact(tmp_path):
+    # Both HOST entries receive one physical global window. Only first owns
+    # another window, so its local scope must coexist with the inherited ABI.
+    program = pl.parse_program("""
+@pl.program
+class GlobalEntries:
+    @pl.function(type=pl.FunctionType.Orchestration, level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+    def mixed_chip(self, x: pl.Tensor[[8], pl.FP32], count: pl.Scalar[pl.INT32],
+                   data: pld.DistributedTensor[[8], pl.FP32],
+                   local: pld.DistributedTensor[[8], pl.FP32],
+                   out: pl.Out[pl.Tensor[[8], pl.FP32]]):
+        return 0
+    @pl.function(type=pl.FunctionType.Orchestration, level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+    def global_chip(self, x: pl.Tensor[[8], pl.FP32], count: pl.Scalar[pl.INT32],
+                    data: pld.DistributedTensor[[8], pl.FP32],
+                    out: pl.Out[pl.Tensor[[8], pl.FP32]]):
+        return 0
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def first(self, x: pl.Tensor[[8], pl.FP32], count: pl.Scalar[pl.INT32],
+              data: pld.DistributedTensor[[8], pl.FP32],
+              out: pl.Out[pl.Tensor[[8], pl.FP32]], original: pld.CommCtx):
+        local_buffer = pld.alloc_window_buffer(32)
+        local = pld.window(local_buffer, [8], dtype=pl.FP32)
+        self.mixed_chip(x, count, data, local, out, worker=1)
+        return 0
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def second(self, x: pl.Tensor[[8], pl.FP32], count: pl.Scalar[pl.INT32],
+               data: pld.DistributedTensor[[8], pl.FP32],
+               out: pl.Out[pl.Tensor[[8], pl.FP32]], original: pld.CommCtx):
+        self.global_chip(x, count, data, out, worker=1)
+        return 0
+    @pl.function(level=pl.Level.CLUSTER_0, role=pl.Role.Orchestrator)
+    def root(self, x: pl.Tensor[[8], pl.FP32], count: pl.Scalar[pl.INT32],
+             left: pl.Out[pl.Tensor[[8], pl.FP32]], right: pl.Out[pl.Tensor[[8], pl.FP32]]):
+        global_buffer = pld.alloc_window_buffer(32)
+        data = pld.window(global_buffer, [8], dtype=pl.FP32)
+        original = pld.system.get_comm_ctx(data)
+        self.first(x, count, data, left, original, worker=0)
+        self.second(x, count, data, right, original, worker=1)
+        return 0
+""")
+    compiled = ir.compile(
+        program,
+        output_dir=str(tmp_path / "global"),
+        skip_ptoas=True,
+        cluster_config=_config(),
+        platform="a2a3",
+    )
+    return compiled
+
+
+def test_i1_global_full_native_pipeline_preserves_cold_domain_contract(i1_global_artifact):
+    from contextlib import nullcontext  # noqa: PLC0415
+
+    from pypto.runtime._distributed_support import _decode_scalar  # noqa: PLC0415
+    from simpler.buffer import create_host_shared_buffer, mint_owner_instance_id  # noqa: PLC0415
+    from simpler.task_interface import CallConfig, DataType  # noqa: PLC0415
+
+    compiled = i1_global_artifact
+    restored = ir.DistributedCompiledProgram.from_dir(compiled.output_dir, platform="a2a3")
+    assert restored.program is None and restored.l3_entries == compiled.l3_entries
+    records = compiled.l3_entries["entries"]
+    assert [record["entry_name"] for record in records] == ["first", "second"]
+    for record in records:
+        layout = record["layout"]
+        assert layout["version"] == 1 and len(layout["window_slots"]) == 1
+        assert len(layout["tensor_slots"]) == 2  # Received DT is absent from dense tensor wire.
+        assert [row[3] for row in layout["scalar_slots"]] == ["int32", "comm_ctx", "comm_ctx"]
+        assert ["inherited_domain_tokens", 2] in layout["prefork_requirements"]
+        assert ["domain_dispatch", 2, [1]] in layout["prefork_requirements"]
+        local = [row for row in layout["prefork_requirements"] if row[0] == "local_domain_tokens"]
+        assert bool(local) == (record["entry_name"] == "first")
+        source = (compiled.output_dir / record["logical_path"] / "orchestration/host_orch.py").read_text()
+        compile(source, record["module"], "exec")
+    source = (compiled.output_dir / "orchestration/cluster_orch.py").read_text()
+    assert ".domain_id" in source and ".device_ctx" not in source
+    namespace = {"_io_arg": lambda binding, tensor, tag: descriptor}
+    exec(compile(source, "cluster_orch.py", "exec"), namespace)
+    backing = create_host_shared_buffer(32, mint_owner_instance_id(), 1)
+    try:
+        descriptor = backing.tensor(shapes=(8,), dtype=DataType.FLOAT32)
+        calls = []
+        domain_id = (1 << 63) + 907
+        orch = SimpleNamespace(
+            allocate_global_domain=lambda **kwargs: nullcontext(SimpleNamespace(domain_id=domain_id)),
+            submit_next_level=lambda handle, incoming, cfg, *, worker: calls.append(incoming),
+        )
+        infos = compiled._get_metadata()[0]
+        tensors = {info.name: (-7 if info.shape is None else torch.zeros(8)) for info in infos}
+        namespace[compiled.entry_name](
+            orch,
+            None,
+            CallConfig(),
+            tensors=tensors,
+            callables={record["entry_name"]: [object(), object()] for record in records},
+            nodes=[7, 13],
+            node_sizes=[2, 2],
+            node_bindings=[None, None],
+            _keep=[],
+            _retain=False,
+        )
+        assert len(calls) == 2
+        assert all(_decode_scalar(args.scalar(0), "int32") == -7 for args in calls)
+        assert all([args.scalar(i) for i in (1, 2)] == [domain_id, domain_id] for args in calls)
+    finally:
+        backing.close()
+
+
+def test_i1_parent_allocates_global_domain_only_in_active_graph(
+    i1_global_artifact, cluster_runner_harness, monkeypatch
+):
+    # Replace process/device transport only. The entry and all TaskArgs below
+    # are real output of the complete native compiler, including ctx suffixes.
+    from contextlib import contextmanager  # noqa: PLC0415
+
+    from pypto.runtime._distributed_support import _decode_scalar  # noqa: PLC0415
+
+    runner, state = cluster_runner_harness
+    base = runner.Worker
+    allocations = []
+
+    class Worker(base):
+        def run(self, function, args=None, config=None):
+            @contextmanager
+            def allocate(**kwargs):
+                assert self.in_graph, "R1 allocation requires the active parent graph"
+                assert kwargs["members"] == [(7, 0), (7, 1), (13, 0), (13, 1)]
+                assert kwargs.get("retain_after_run", False) is False
+                allocations.append(kwargs)
+                yield SimpleNamespace(domain_id=(1 << 63) + len(allocations))
+
+            self.in_graph = True
+            try:
+                function(
+                    SimpleNamespace(
+                        allocate_global_domain=allocate,
+                        submit_next_level=lambda handle, incoming, cfg, *, worker: state.tasks.append(
+                            (handle, incoming, worker)
+                        ),
+                    ),
+                    args,
+                    config,
+                )
+            finally:
+                self.in_graph = False
+            state.events.append("drained")
+
+    monkeypatch.setattr(runner, "Worker", Worker)
+    monkeypatch.setattr(
+        runner,
+        "_assemble_cluster_chips",
+        lambda compiled: {
+            path: (object(), compiled.cluster_config.runtime, {})
+            for record in compiled.l3_entries["entries"]
+            for path in record["chip_paths"].values()
+        },
+    )
+    with i1_global_artifact.prepare() as prepared:
+        for _ in range(3):
+            prepared(torch.ones(8), -7, torch.zeros(8), torch.zeros(8))
+    assert len(allocations) == 3 and len(state.tasks) == 6
+    for index, (_, incoming, worker) in enumerate(state.tasks):
+        assert worker == (7, 13)[index % 2]
+        assert incoming.tensor_count() == 2 and incoming.scalar_count() == 3
+        assert _decode_scalar(incoming.scalar(0), "int32") == -7
+        assert [incoming.scalar(i) for i in (1, 2)] == [
+            (1 << 63) + index // 2 + 1,
+            (1 << 63) + index // 2 + 1,
+        ]
+
+
+_I1_BOOTSTRAP_PROOF = (
+    _RUNTIME_IMPORT_PROOF.split("helper = importlib.import_module", 1)[0]
+    + r"""
+import ctypes
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest import mock
+import json
+import torch
+import simpler.buffer as buffer_api
+from simpler.buffer import create_host_shared_buffer, mint_owner_instance_id
+from simpler.startup_preparation import NodeStartupContext
+from simpler.task_interface import (
+    CallConfig, ChipDomainContext, CommDomainHandle, DataType, GlobalCommDomainView,
+    GlobalDomainMember, TaskArgs, TensorArgType,
+)
+from simpler.worker import Worker
+bootstrap = importlib.import_module(namespace + '.orchestration.cluster_bootstrap')
+support = importlib.import_module(namespace + '.orchestration._distributed_support')
+records = json.loads((installed[0].root / 'distributed_meta.json').read_text())['l3_entries']['entries']
+paths = {path for record in records for path in record['chip_paths'].values()}
+digests = {path: str(index + 1).zfill(64) for index, path in enumerate(sorted(paths))}
+handles = {digest: object() for digest in digests.values()}
+# Physical IDs are not local worker IDs. The CPU worker below supplies the
+# real prefork Tensor conversion; CHIP execution remains a recorded boundary.
+inner = SimpleNamespace(_config={'device_ids': [12, 15]}, register=lambda fn: object())
+state = bootstrap.prepare_node(NodeStartupContext(
+    rank=0, artifact_roots={digest: installed[0].root}, inner_worker=inner, chip_handles=handles,
+    parameters={'module_prefix': namespace, 'entries': records, 'chip_digests': digests,
+                'chip_configs': {path: {} for path in paths}},
+))
+entries = [getattr(importlib.import_module(namespace + '.' + r['module']), r['qualname']) for r in records]
+node = entries[0]._pypto_embedded_state.node_state
+assert node is entries[1]._pypto_embedded_state.node_state
+assert node.local_worker_ids == (0, 1)
+capacity = len(node._tokens)
+assert 1 <= capacity <= sum(row[1] for r in records for row in r['layout']['prefork_requirements']
+                            if row[0] == 'inherited_domain_tokens')
+token_ptrs = {t.untyped_storage().data_ptr() for bundle in node._tokens for t in bundle}
+assert len(token_ptrs) == capacity * 2
+local_tokens = [t for entry in entries for spec in entry._pypto_embedded_state._local_specs.values()
+                for t in spec[1].values()]
+assert not token_ptrs.intersection(t.untyped_storage().data_ptr() for t in local_tokens)
+owner = mint_owner_instance_id()
+buffers = [create_host_shared_buffer(64, owner, index + 1) for index in range(5)]
+worker = Worker(level=3, num_sub_workers=0)
+calls, local_domains = [], []
+view = None
+try:
+    worker.init()
+    x, out = [buffer.tensor(shapes=(8,), dtype=DataType.FLOAT32) for buffer in buffers[:2]]
+    name = records[0]['layout']['window_slots'][0][4]
+    members = tuple(GlobalDomainMember(node_worker_id=7 if rank in (4, 9) else 100 + rank,
+                    local_worker_id=0 if rank == 4 else 1 if rank == 9 else 0,
+                    global_device_rank=rank, domain_rank=rank) for rank in range(12))
+
+    def domain(domain_id, generation):
+        result = GlobalCommDomainView(name='received', members=members,
+            contexts={local: ChipDomainContext(name='received', domain_rank=rank, domain_size=12,
+                device_ctx=80000 + local, local_window_base=0, actual_window_size=64,
+                buffers={name: buffers[2 + local]}) for local, rank in ((0, 4), (1, 9))},
+            domain_id=domain_id, generation=generation, mapping_size=64)
+        result._committed = True
+        return result
+
+    @contextmanager
+    def allocate_local(**kwargs):
+        assert kwargs['workers'] == [1]
+        local = CommDomainHandle(name=kwargs['name'], workers=(1,), allocation_id=601,
+            contexts={1: ChipDomainContext(name=kwargs['name'], domain_rank=0, domain_size=1,
+                device_ctx=90001, local_window_base=0, actual_window_size=64,
+                buffers={spec.name: buffers[4] for spec in kwargs['buffers']})},
+            _release_fn=lambda handle: None)
+        local_domains.append(local)
+        with local:
+            yield local
+
+    def submit(handle, incoming, config, *, worker):
+        assert worker == 1
+        calls.append((handle, incoming))
+
+    def resolve(domain_id):
+        assert domain_id == view.domain_id
+        return view
+
+    orch = SimpleNamespace(_worker=worker, get_global_domain=resolve,
+                           allocate_domain=allocate_local, submit_next_level=submit)
+    def incoming(domain_id):
+        args = TaskArgs()
+        args.add_tensor(x, TensorArgType.INPUT)
+        args.add_tensor(out, TensorArgType.OUTPUT_EXISTING)
+        for value in (ctypes.c_int32(-7), ctypes.c_uint64(domain_id), ctypes.c_uint64(domain_id)):
+            args.add_scalar(value)
+        return args
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Storage allocation after prefork preparation')
+
+    with mock.patch.object(torch, 'zeros', forbidden), mock.patch.object(torch, 'empty', forbidden), \
+         mock.patch.object(torch.Tensor, 'share_memory_', forbidden), \
+         mock.patch.object(buffer_api, 'create_host_shared_buffer', forbidden):
+        stable = None
+        for generation in range(1, capacity + 5):
+            view = domain((1 << 63) + generation // 2, generation)
+            if generation == 1:
+                for failure in ('uncommitted', 'missing_context'):
+                    before = dict(node._bindings)
+                    calls.clear()
+                    missing = view.contexts.pop(1) if failure == 'missing_context' else None
+                    if failure == 'uncommitted':
+                        view._committed = False
+                    try:
+                        entries[0](orch, incoming(view.domain_id), CallConfig())
+                    except (ValueError, RuntimeError, KeyError):
+                        pass
+                    else:
+                        raise AssertionError('Invalid received domain reached CHIP submission')
+                    finally:
+                        view._committed = True
+                        if missing is not None:
+                            view.contexts[1] = missing
+                    assert not calls and node._bindings == before
+                    assert entries[0]._pypto_embedded_state._frame is None
+            shared = None
+            for index, entry in enumerate(entries):
+                calls.clear()
+                entry(orch, incoming(view.domain_id), CallConfig())
+                assert len(calls) == 1
+                _, sent = calls[0]
+                assert sent.scalar_count() == (3 if index == 0 else 2)
+                assert support._decode_scalar(sent.scalar(0), 'int32') == -7
+                assert sent.scalar(1) == view[1].device_ctx
+                assert sent.scalar(sent.scalar_count() - (2 if index == 0 else 1)) == view[1].device_ctx
+                expected = view[1].buffers[name].tensor(shapes=(8,), dtype=DataType.FLOAT32)
+                assert sent.tensor(1) == expected
+                token_index = 4 if index == 0 else 3
+                global_token = sent.tensor(token_index)
+                assert sent.tag(token_index) == TensorArgType.INOUT
+                if shared is not None:
+                    assert global_token == shared, 'Live physical domain changed token between HOST entries'
+                shared = global_token
+                if index == 0:
+                    assert sent.scalar(sent.scalar_count() - 1) == 90001
+                    assert sent.tensor(2).buffer != expected.buffer
+                    assert sent.tensor(token_index + 1) != global_token
+                    assert local_domains[-1].released
+                state.task_completed()
+                assert entry._pypto_embedded_state._frame is None
+            if stable is None:
+                stable = shared
+            assert len(node._tokens) == capacity
+            # R1 invalidates this same view before destructive release fanout.
+            # Completion alone must preserve its token; invalidation plus drain
+            # allows reuse on the next acquisition without a manual retirement.
+            assert (view.domain_id, view.generation) in node._bindings
+            view._committed = False
+        assert len(node._bindings) <= capacity
+    assert not guard.attempts
+    print('I1_GLOBAL_BOOTSTRAP_PASS')
+finally:
+    worker.close()
+    state.close()
+    for backing in buffers:
+        backing.close()
+"""
+)
+
+
+def test_i1_global_bootstrap_uses_canonical_prefork_tokens_and_bounded_retirement(
+    i1_global_artifact, tmp_path
+):
+    runtime_python = os.environ.get("L4_RUNTIME_ONLY_PYTHON")
+    runtime_pythonpath = os.environ.get("L4_RUNTIME_ONLY_PYTHONPATH")
+    if not runtime_python or not runtime_pythonpath:
+        pytest.skip("Set L4_RUNTIME_ONLY_PYTHON and L4_RUNTIME_ONLY_PYTHONPATH")
+    digest, payload = _artifact_sources.build_cluster_source_bundle(i1_global_artifact.output_dir)
+    archive = tmp_path / "global-sources.tar.gz"
+    archive.write_bytes(payload)
+    result = subprocess.run(
+        [
+            runtime_python,
+            "-c",
+            _I1_BOOTSTRAP_PROOF,
+            "installed_" + digest,
+            digest,
+            str(archive),
+            str(tmp_path / "installed-global"),
+        ],
+        cwd=tmp_path,
+        env=os.environ | {"PYTHONPATH": runtime_pythonpath, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "I1_GLOBAL_BOOTSTRAP_PASS" in result.stdout
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

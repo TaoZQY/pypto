@@ -90,6 +90,25 @@ Every MPI rank installs/activates these sources, resolves its local CHIP handles
 binds native HOST entries and allocates static shared storage before inner-worker
 initialization. Rank sources import no PyPTO, compiler or `kernel_config.py`.
 
+CLUSTER-owned global windows pass through HOST entries as uint64 domain IDs,
+without a tensor wire slot. Each receiving entry resolves the committed runtime
+view and selects the named buffer and `device_ctx` for the target local CHIP
+worker. Domain rank counts come from that context's `domain_size`, independently
+of the node count or local device count. A HOST entry may also own a local domain;
+its buffers and ordering tokens remain separate from inherited global domains.
+This supports direct CHIP dispatch with paired DT contexts; HOST public
+collectives on inherited global windows remain outside this execution contract.
+
+Bootstrap prepares one node-wide inherited ordering-token pool before the inner
+fork, bounded by the sum of the entries' persisted received-context capacities.
+Local worker IDs follow the actual runtime CHIP topology, rather than physical
+device IDs or global domain ranks. Aliases and separate HOST entries share one
+canonical lease per `(domain_id, generation)`. Completing an entry releases its
+active frame but preserves the lease while the imported view remains committed.
+On the next acquisition, an inactive lease may reuse its storage only after R1
+has invalidated that same view for domain release. Preflight failure changes no
+leases. Invocation and domain rebinding allocate no additional shared storage.
+
 Runs accept ordinary contiguous CPU tensors, including tensors allocated after
 `prepare()`, plus scalar arguments. Every rank, including a local rank zero,
 uses remote allocations/copies. Storage-relative contiguous views and aliases
@@ -100,8 +119,10 @@ and argument frames, refuses further dispatch, and permits retrying close.
 Parent source loading creates no bytecode cache inside the immutable artifact.
 Cross-node overlapping ordinary write/read or
 write/write ranges are unsupported because they require explicit forwarding.
-Global windows, asynchronous submission, runtime callback overrides and
-multi-program `extra_compiled` sessions report an unsupported-operation error.
+Global domains are allocated inside the active parent graph and released through
+R1's deferred cleanup after its DAG drains. Asynchronous submission, runtime
+callback overrides and multi-program `extra_compiled` sessions report an
+unsupported-operation error.
 These restrictions do not change HOST schema-3 execution or its callbacks.
 
 `ExecutionCapabilities` in `pypto._artifact_contract` is immutable and validated;

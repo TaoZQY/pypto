@@ -375,8 +375,10 @@ class _EmbeddedNodeState:
     """Bounded shared token leases; storage is supplied before the inner fork.
 
     Worker IDs identify participating local workers, independently of global
-    domain ranks. Completed leases remain stable across entry calls until an
-    explicit retire_domain releases their slot. No method allocates tensors.
+    domain ranks. Completed leases remain stable across entry calls while the
+    imported view stays committed. Invalidated, drained views can release their
+    slots on the next acquisition; explicit retirement remains available after
+    drain. No method allocates tensors.
     """
 
     def __init__(
@@ -409,13 +411,24 @@ class _EmbeddedNodeState:
         self.local_worker_ids = local_worker_ids
         self._tokens = prepared_domain_tokens
         self._bindings: dict[tuple[int, int], tuple[int, int]] = {}
+        self._domain_views: dict[tuple[int, int], Any] = {}
         self._closed = False
 
     def acquire(self, domains: Mapping[tuple[int, int], Any]) -> dict[tuple[int, int], dict[int, Any]]:
         if self._closed:
             raise RuntimeError("Embedded node state is closed")
-        missing = [key for key in domains if key not in self._bindings]
-        occupied = {slot for slot, _ in self._bindings.values()}
+        # R1 invalidates the same imported view before destructive domain
+        # release. Keep a strong reference until that boundary AND completion
+        # of every entry lease; task completion alone cannot break the shared
+        # ordering chain of a still-live physical domain.
+        retired = {
+            key
+            for key, (_, active) in self._bindings.items()
+            if not active and not self._domain_views[key].committed
+        }
+        bindings = {key: binding for key, binding in self._bindings.items() if key not in retired}
+        missing = [key for key in domains if key not in bindings]
+        occupied = {slot for slot, _ in bindings.values()}
         free = [slot for slot in range(len(self._tokens)) if slot not in occupied]
         if len(missing) > len(free):
             raise ValueError(
@@ -424,18 +437,22 @@ class _EmbeddedNodeState:
         for domain_id, generation in domains:
             if any(
                 existing_id == domain_id and existing_generation != generation and active
-                for (existing_id, existing_generation), (_, active) in self._bindings.items()
+                for (existing_id, existing_generation), (_, active) in bindings.items()
             ):
                 raise RuntimeError("A prior generation still has active invocation leases")
         # All validation/capacity checks precede the commit. Calls with aliases
         # acquire one canonical key once; no failed preflight changes this map.
         for key, slot in zip(missing, free):
-            self._bindings[key] = (slot, 0)
+            bindings[key] = (slot, 0)
         result = {}
         for key in domains:
-            slot, active = self._bindings[key]
-            self._bindings[key] = (slot, active + 1)
+            slot, active = bindings[key]
+            bindings[key] = (slot, active + 1)
             result[key] = dict(zip(self.local_worker_ids, self._tokens[slot]))
+        views = {key: view for key, view in self._domain_views.items() if key not in retired}
+        views.update((key, domains[key]) for key in missing)
+        self._bindings = bindings
+        self._domain_views = views
         return result
 
     def release(self, keys: tuple[tuple[int, int], ...]) -> None:
@@ -455,11 +472,13 @@ class _EmbeddedNodeState:
                 "Domain retirement requires all active invocation frames to complete and drain"
             )
         del self._bindings[key]
+        self._domain_views.pop(key)
 
     def close(self) -> None:
         if any(active for _, active in self._bindings.values()):
             raise RuntimeError("Node close requires active invocation frames to complete and drain")
         self._bindings.clear()
+        self._domain_views.clear()
         self._tokens = ()
         self._closed = True
 

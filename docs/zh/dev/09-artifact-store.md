@@ -69,13 +69,27 @@ CLUSTER_0 的 `compiled.prepare()` 返回同步 `ClusterWorker`；`compiled(*arg
 原生 HOST 入口，并在内部 Worker 初始化前分配静态共享存储。rank 源码不导入 PyPTO、
 编译器或 `kernel_config.py`。
 
+CLUSTER 拥有的全局窗口以 uint64 域 ID 穿过 HOST 入口，不占用 Tensor wire 槽位。
+接收入口解析运行时已提交的域视图，并按目标本地 CHIP Worker 选择命名缓冲区和
+`device_ctx`。域内 rank 数取自该上下文的 `domain_size`，与节点数或本地设备数独立。
+HOST 入口也可以同时拥有本地域；其缓冲区和排序 token 与继承的全局域分开保存。
+该执行契约支持通过成对 DT 上下文直接下发 CHIP；继承全局窗口上的 HOST 公开
+collective 不属于该契约范围。
+
+bootstrap 在内部 fork 前准备节点共享的继承域排序 token 池，其容量上限为各入口
+持久化接收上下文容量之和。本地 Worker ID 来自实际运行时 CHIP 拓扑，而非物理设备
+ID 或全局域 rank。别名和不同 HOST 入口按 `(domain_id, generation)` 共用规范租约。
+入口完成时释放活动参数帧，但只要导入视图仍已提交，就保留该租约。后续获取租约时，
+只有在 R1 已为域释放而撤销同一视图、且原租约不再活动后，才可复用其存储。
+预检查失败不改变租约；调用和域重绑定均不额外分配共享存储。
+
 执行接受普通连续 CPU Tensor（也允许在 `prepare()` 后分配）及 Scalar。所有 rank，
 包括同主机 rank 0，均使用远程分配及拷贝；保留基于存储偏移的连续视图与别名。完整
 DAG 成功后，所有 rank 的输出统一回拷，随后才释放远程分配；DAG 失败则关闭层级，不发布
 部分输出。关闭失败时保留调用存储与参数帧，拒绝继续执行，并允许重试关闭。父进程加载
 源码时不会在不可变产物内创建字节码缓存。跨节点重叠的普通读写或写写范围需要显式转发，
-目前明确拒绝。全局窗口、异步
-提交、运行时 callback 覆盖及多程序 `extra_compiled` 会话同样报告尚未支持。上述限制
+目前明确拒绝。全局域在父进程的活动 graph 内分配，由 R1 在 DAG 排空后执行延迟释放。
+异步提交、运行时 callback 覆盖及多程序 `extra_compiled` 会话同样报告尚未支持。上述限制
 不改变 schema 3 的 HOST 执行及其 callback 行为。
 
 `pypto._artifact_contract` 中的 `ExecutionCapabilities` 是经过校验的不可变记录；

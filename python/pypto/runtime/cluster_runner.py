@@ -186,7 +186,7 @@ def _io_arg(binding: tuple[_InvocationIO, int], tensor: torch.Tensor, tag: Any) 
 
 
 class ClusterWorker:
-    """Prepared CLUSTER_0 session for synchronous ordinary Tensor/Scalar runs.
+    """Prepared CLUSTER_0 session for synchronous Tensor/Scalar and global-window runs.
 
     All CHIP compilation happens on the parent. The installed rank source
     package imports only Simpler/Torch and is prepared before the inner fork.
@@ -209,9 +209,6 @@ class ClusterWorker:
         cc = compiled.cluster_config
         records = compiled.l3_entries["entries"]
         for record in records:
-            layout = record["layout"]
-            if layout["window_slots"] or any(row[3] == "comm_ctx" for row in layout["scalar_slots"]):
-                raise NotImplementedError("Cluster global windows require the global-domain runner")
             required = compiled.output_dir / record["logical_path"] / "sub_workers/__required__.json"
             if required.exists() and json.loads(required.read_text(encoding="utf-8")):
                 raise NotImplementedError("Cluster runtime-bound SUB callbacks are unsupported")

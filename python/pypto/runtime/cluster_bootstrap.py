@@ -20,7 +20,7 @@ from typing import Any
 
 import torch
 
-from ._distributed_support import _ChipCallables, _copy_return_tensor, _EmbeddedEntryState
+from ._distributed_support import _ChipCallables, _copy_return_tensor, _EmbeddedEntryState, _EmbeddedNodeState
 
 
 def _freeze(value: Any) -> Any:
@@ -42,6 +42,7 @@ class _NodeBindings:
 
     def __init__(self) -> None:
         self.entries: list[tuple[Any, _EmbeddedEntryState]] = []
+        self.node_state: _EmbeddedNodeState | None = None
 
     def task_completed(self) -> None:
         """Called by the generic command loop after a successful DAG fence."""
@@ -55,6 +56,9 @@ class _NodeBindings:
             if getattr(entry, "_pypto_embedded_state", None) is state:
                 del entry._pypto_embedded_state
         self.entries.clear()
+        if self.node_state is not None:
+            self.node_state.close()
+            self.node_state = None
 
 
 def _validated_entries(prefix: str, records: list[dict[str, Any]]) -> list[tuple[Any, Any, Any]]:
@@ -77,8 +81,6 @@ def _validated_entries(prefix: str, records: list[dict[str, Any]]) -> list[tuple
         layout = getattr(entry, "_pypto_embedded_layout", None)
         if not isinstance(layout, MappingProxyType) or dict(layout) != _freeze(record["layout"]):
             raise ValueError(f"Cluster bootstrap native layout differs from cold entry {qualname!r}")
-        if layout["window_slots"] or any(row[3] == "comm_ctx" for row in layout["scalar_slots"]):
-            raise NotImplementedError("Cluster global windows require the global-domain runner")
         if not isinstance(record["local_device_count"], int) or record["local_device_count"] <= 0:
             raise ValueError("Cluster bootstrap requires a positive local device count")
         validated.append((record, entry, layout))
@@ -121,6 +123,28 @@ def prepare_node(context: Any) -> _NodeBindings:
 
     bindings = _NodeBindings()
     try:
+        # Every entry can receive distinct physical domains. Their persisted
+        # ctx upper bounds provide one finite pool shared by all entry states;
+        # aliases acquire a single lease only after the actual views arrive.
+        capacity = sum(
+            row[1]
+            for _, _, layout in validated
+            for row in layout["prefork_requirements"]
+            if row[0] == "inherited_domain_tokens"
+        )
+        if capacity:
+            # R1 numbers local CHIP children densely, independently of their
+            # physical device IDs and the domain's global ranks. This topology
+            # already exists before init() forks the receiving worker's children.
+            count = len(context.inner_worker._config.get("device_ids", ()))
+            if not count or any(record["local_device_count"] != count for record, _, _ in validated):
+                raise ValueError("Cluster inherited domains require the declared local CHIP topology")
+            bindings.node_state = _EmbeddedNodeState(
+                local_worker_ids=tuple(range(count)),
+                prepared_domain_tokens=tuple(
+                    tuple(_tensor("int32", (1,)) for _ in range(count)) for _ in range(capacity)
+                ),
+            )
         for record, entry, layout in validated:
             count = record["local_device_count"]
             prepared: dict[str, Any] = {}
@@ -129,8 +153,13 @@ def prepare_node(context: Any) -> _NodeBindings:
                     prepared[row[1]] = _tensor(row[2], row[3])
                 elif row[0] == "local_domain_tokens":
                     prepared[row[1]] = tuple(_tensor("int32", (1,)) for _ in range(count))
-                elif row[0] != "return_copy_subworker":
-                    raise NotImplementedError(f"Cluster global-domain preparation is unsupported: {row[0]}")
+                elif row[0] not in {
+                    "return_copy_subworker",
+                    "inherited_domain_tokens",
+                    "domain_dispatch",
+                    "same_domain",
+                }:
+                    raise NotImplementedError(f"Cluster prefork preparation is unsupported: {row[0]}")
             callables = _ChipCallables()
             for name, path in record["chip_paths"].items():
                 callables.add(name, context.chip_handles[digests[path]], configs[path])
@@ -149,6 +178,7 @@ def prepare_node(context: Any) -> _NodeBindings:
                 prepared_tensors=prepared,
                 domain_provider=None,
                 return_copy_callable=copying,
+                node_state=bindings.node_state,
             )
             entry._pypto_embedded_state = state
             bindings.entries.append((entry, state))
