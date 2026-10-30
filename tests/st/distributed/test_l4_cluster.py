@@ -286,8 +286,7 @@ def _shared_programs(local_devices: int, rank_count: int):
     return compute, communication
 
 
-@pytest.mark.platforms("a2a3", "a2a3sim")
-def test_i2_l4_two_program_compute_then_tload_every_rank(test_config, tmp_path):
+def _run_shared_programs(test_config, tmp_path, *, cold: bool = False, default_reset: bool = False):
     from pypto import ir  # noqa: PLC0415
 
     cluster = _cluster_config()
@@ -318,6 +317,28 @@ def test_i2_l4_two_program_compute_then_tload_every_rank(test_config, tmp_path):
         config=replace(config, save_kernels_dir=str(tmp_path / "two-programs" / "communication")),
     )
     assert compute.output_dir != communication.output_dir, "Each compiled program must own its artifacts"
+    if cold:
+        compute_domains, communication_domains = compute.comm_domains, communication.comm_domains
+        compute_platform, communication_platform = compute.platform, communication.platform
+        # Execute only metadata-restored objects: neither can consult post-pass IR
+        # when validating sharing or assembling the generated runtime artifacts.
+        compute = ir.DistributedCompiledProgram.from_dir(
+            compute.output_dir,
+            backend_type=BackendType.Ascend910,
+            execution_mode=test_config.execution_mode,
+        )
+        communication = ir.DistributedCompiledProgram.from_dir(
+            communication.output_dir,
+            backend_type=BackendType.Ascend910,
+            execution_mode=test_config.execution_mode,
+        )
+        assert compute._program is None
+        assert communication._program is None
+        assert compute.platform == compute_platform
+        assert communication.platform == communication_platform
+        assert compute.cluster_config == communication.cluster_config == cluster
+        assert compute.comm_domains == compute_domains
+        assert communication.comm_domains == communication_domains
     binding = getattr(ir, "SharedDomainBinding", None)
     assert callable(binding), "I2 requires public explicit session sharing"
     assert len(compute.comm_domains) == len(communication.comm_domains) == 1
@@ -325,14 +346,17 @@ def test_i2_l4_two_program_compute_then_tload_every_rank(test_config, tmp_path):
         compute.comm_domains[0]["slots"][0]["generated_name"]
         != (communication.comm_domains[0]["slots"][0]["generated_name"])
     )
+    # Omit the reset option to exercise the public default, rather than passing
+    # True and accidentally leaving the None -> True contract untested.
+    reset_options = {} if default_reset else {"reset_persistent_windows": False}
     with compute.prepare(
         extra_compiled=[communication],
         persistent=True,
-        reset_persistent_windows=False,
         shared_domains=[
             binding(program=compute, domain=0, key="activations", slots={0: "values"}),
             binding(program=communication, domain=0, key="activations", slots={0: "values"}),
         ],
+        **reset_options,
     ) as worker:
         for iteration in range(2):
             current = inputs + iteration * 1000
@@ -342,7 +366,26 @@ def test_i2_l4_two_program_compute_then_tload_every_rank(test_config, tmp_path):
             assert torch.equal(echo, current + rhs)
             worker.run(communication, peer_values)
             expected = (current + rhs).reshape(nranks, SIZE)
+            if default_reset:
+                # Compute really wrote the changed sum (echo above); the next
+                # run must clear every shared peer window before any TLOAD.
+                expected = torch.zeros_like(expected)
             assert torch.equal(peer_values, expected.expand_as(peer_values))
+
+
+@pytest.mark.platforms("a2a3", "a2a3sim")
+def test_i2_l4_two_program_compute_then_tload_every_rank(test_config, tmp_path):
+    _run_shared_programs(test_config, tmp_path)
+
+
+@pytest.mark.platforms("a2a3", "a2a3sim")
+def test_i3_l4_cold_two_program_compute_then_tload_every_rank(test_config, tmp_path):
+    _run_shared_programs(test_config, tmp_path, cold=True)
+
+
+@pytest.mark.platforms("a2a3", "a2a3sim")
+def test_i3_l4_shared_domains_default_reset_every_rank(test_config, tmp_path):
+    _run_shared_programs(test_config, tmp_path, default_reset=True)
 
 
 if __name__ == "__main__":
