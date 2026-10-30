@@ -317,6 +317,16 @@ class _EmbeddedFrame:
         self.domain_tokens: dict[tuple[int, int], dict[int, Any]] = {}
         self.local_tokens: dict[int, Mapping[int, Any]] = {}
         self.local_specs: dict[str, tuple[tuple[int, ...], Mapping[int, Any]]] = {}
+        self.window_slots: Mapping[tuple[int, int, str], str] = {}
+
+    def window_tensor(self, domain: Any, worker: int, logical_name: str, **view: Any) -> Any:
+        """Translate a slot identity, then use the actual runtime Buffer object."""
+        physical = logical_name
+        if hasattr(domain, "domain_id"):
+            physical = self.window_slots.get(
+                (domain.domain_id, domain.generation, logical_name), logical_name
+            )
+        return _domain_context(domain, worker).buffers[physical].tensor(**view)
 
     @staticmethod
     def require_same_domain(domains: tuple[Any, ...]) -> None:
@@ -919,6 +929,109 @@ def _domain_requirements(
     return workers, tuple(groups), locals_
 
 
+def _domain_bindings(value: Any, layout: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    """Snapshot bounded native binding records without requiring the compiler."""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("Domain slot bindings must be a sequence")
+    result, names = [], set()
+    windows = {(row[3], row[4]) for row in layout["window_slots"]}
+    for binding in value:
+        if (
+            not isinstance(binding, Mapping)
+            or set(binding) != {"name", "members", "window_size", "slots", "windows"}
+            or not isinstance(binding["name"], str)
+            or not binding["name"]
+            or binding["name"] in names
+        ):
+            raise ValueError("Invalid domain slot binding fields/name")
+        slots, members, selected = binding["slots"], binding["members"], binding["windows"]
+        if (
+            not isinstance(slots, (list, tuple))
+            or not 0 < len(slots) <= 64
+            or any(
+                not isinstance(slot, (list, tuple))
+                or len(slot) != 2
+                or not isinstance(slot[0], str)
+                or not slot[0]
+                or type(slot[1]) is not int
+                or slot[1] <= 0
+                or slot[1] % 64
+                for slot in slots
+            )
+            or len({slot[0] for slot in slots}) != len(slots)
+            or type(binding["window_size"]) is not int
+            or sum(slot[1] for slot in slots) != binding["window_size"]
+        ):
+            raise ValueError("Invalid canonical slot sizes/alignment/window")
+        if (
+            not isinstance(members, (list, tuple))
+            or not 0 < len(members) <= 64
+            or any(
+                not isinstance(member, (list, tuple))
+                or len(member) != 3
+                or any(type(item) is not int or item < 0 for item in member)
+                or member[2] != rank
+                for rank, member in enumerate(members)
+            )
+            or len({member[0] for member in members}) != len(members)
+        ):
+            raise ValueError("Invalid ordered domain member layout")
+        if (
+            not isinstance(selected, (list, tuple))
+            or not selected
+            or any(
+                not isinstance(row, (list, tuple))
+                or len(row) != 3
+                or type(row[0]) is not int
+                or (row[0], row[1]) not in windows
+                or row[2] not in {slot[0] for slot in slots}
+                for row in selected
+            )
+            or len({(row[0], row[1]) for row in selected}) != len(selected)
+        ):
+            raise ValueError("Invalid logical-to-canonical window bindings")
+        names.add(binding["name"])
+        result.append(
+            MappingProxyType(
+                {
+                    "name": binding["name"],
+                    "window_size": binding["window_size"],
+                    "members": tuple(tuple(row) for row in members),
+                    "slots": tuple(tuple(row) for row in slots),
+                    "windows": tuple(tuple(row) for row in selected),
+                }
+            )
+        )
+    return tuple(result)
+
+
+def _validate_physical_domain(view: Any, binding: Mapping[str, Any]) -> None:
+    members = tuple(
+        (member.global_device_rank, member.local_worker_id, member.domain_rank) for member in view.members
+    )
+    if members != binding["members"] or view.mapping_size < binding["window_size"]:
+        raise ValueError("Global domain ordered members or mapping size differ from session layout")
+    for worker in view.contexts:
+        context = _domain_context(view, worker)
+        if (
+            context.actual_window_size != view.mapping_size
+            or context.domain_size != len(members)
+            or type(context.local_window_base) is not int
+            or context.local_window_base <= 0
+            or context.local_window_base % 64
+            or members[context.domain_rank][1] != worker
+        ):
+            raise ValueError("Global domain physical window size/alignment/rank differs from session layout")
+        offset = 0
+        for name, size in binding["slots"]:
+            if name not in context.buffers:
+                raise ValueError(f"Global domain is missing canonical slot {name!r}")
+            buffer = context.buffers[name]
+            if int(buffer.base) != context.local_window_base + offset or int(buffer.nbytes) != size:
+                raise ValueError("Global domain physical slot offset/size differs from canonical layout")
+            offset += size
+
+
 def _resolve_embedded_domains(
     layout: Mapping[str, Any],
     args: Any,
@@ -926,6 +1039,8 @@ def _resolve_embedded_domains(
     orch: Any,
     workers: Mapping[int, tuple[int, ...]],
     groups: tuple[tuple[int, ...], ...],
+    bindings: tuple[Mapping[str, Any], ...] = (),
+    slot_map: dict[tuple[int, int, str], str] | None = None,
 ) -> dict[tuple[int, int], Any]:
     by_id, by_scalar, domains = {}, {}, {}
     for _, name, index, dtype in layout["scalar_slots"]:
@@ -947,6 +1062,17 @@ def _resolve_embedded_domains(
                 raise ValueError(f"Global domain {domain_id} is not a committed matching generation")
             by_id[domain_id] = view
         view = by_id[domain_id]
+        if bindings:
+            binding = next((binding for binding in bindings if binding["name"] == view.name), None)
+            if binding is None:
+                raise ValueError("Received global domain is absent from the prepared slot bindings")
+            _validate_physical_domain(view, binding)
+            for ctx_index, logical, physical in binding["windows"]:
+                if ctx_index == index and slot_map is not None:
+                    key = (view.domain_id, view.generation, logical)
+                    if key in slot_map and slot_map[key] != physical:
+                        raise ValueError("Aliased CommCtx formals have conflicting canonical slots")
+                    slot_map[key] = physical
         for worker in workers.get(index, ()):
             _domain_context(view, worker)
         tensors[name] = view
@@ -955,9 +1081,11 @@ def _resolve_embedded_domains(
     for group in groups:
         _EmbeddedFrame.require_same_domain(tuple(by_scalar[index] for index in group))
     for _, _, _, ctx_index, window, *_ in layout["window_slots"]:
+        view = by_scalar[ctx_index]
+        physical = (slot_map or {}).get((view.domain_id, view.generation, window), window)
         for worker in workers.get(ctx_index, ()):
-            context = _domain_context(by_scalar[ctx_index], worker)
-            if window not in context.buffers:
+            context = _domain_context(view, worker)
+            if physical not in context.buffers:
                 raise ValueError(
                     f"Global domain is missing named window {window!r} for local worker {worker}"
                 )
@@ -985,6 +1113,7 @@ class _EmbeddedEntryState:
         domain_provider: Any,
         return_copy_callable: Any = None,
         node_state: _EmbeddedNodeState | None = None,
+        domain_bindings: Any = (),
     ) -> None:
         if layout.get("version") != 1:
             raise ValueError(f"Expected embedded layout version 1, got {layout.get('version')!r}")
@@ -1016,6 +1145,7 @@ class _EmbeddedEntryState:
             node_state,
         )
         self.node_state = node_state
+        self._domain_bindings = _domain_bindings(domain_bindings, layout)
         self.layout = MappingProxyType(dict(layout))
         self.callables = callables
         self.sub_ids = sub_ids
@@ -1043,6 +1173,7 @@ class _EmbeddedEntryState:
         for _, name, index, *_ in self.layout["tensor_slots"]:
             tensors[name] = args.tensor(index)
         _validate_formal_shapes(self.layout, tensors)
+        slot_map = {}
         domains = _resolve_embedded_domains(
             self.layout,
             args,
@@ -1050,8 +1181,11 @@ class _EmbeddedEntryState:
             orch,
             self._domain_workers,
             self._domain_groups,
+            self._domain_bindings,
+            slot_map,
         )
         frame = _EmbeddedFrame(tensors, args)
+        frame.window_slots = MappingProxyType(slot_map)
         frame.local_specs = self._local_specs
         frame.implicit_outputs = {
             position: args.tensor(index) for position, index, *_ in self.layout["implicit_outputs"]

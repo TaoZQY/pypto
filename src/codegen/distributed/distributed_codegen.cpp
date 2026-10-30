@@ -1839,8 +1839,12 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
       }
       const std::string view_args = embedded_mode_ ? EmbeddedWindowViewArgs(dist_type, call->span_)
                                                    : "shapes=" + shape + ", dtype=" + dtype_enum;
-      emitter_.EmitLine(ta_var + ".add_tensor(" + handle_var + "[" + rank_expr + "].buffers[\"" + name +
-                        "\"].tensor(" + view_args + "), " + tag + ")");
+      const std::string window_tensor =
+          embedded_mode_
+              ? "_frame.window_tensor(" + handle_var + ", " + rank_expr + ", \"" + name + "\", " + view_args +
+                    ")"
+              : handle_var + "[" + rank_expr + "].buffers[\"" + name + "\"].tensor(" + view_args + ")";
+      emitter_.EmitLine(ta_var + ".add_tensor(" + window_tensor + ", " + tag + ")");
       continue;
     }
 

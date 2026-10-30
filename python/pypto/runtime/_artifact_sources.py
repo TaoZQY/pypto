@@ -232,18 +232,13 @@ def validate_generated_sources(directory: Path, kind: BuildKind) -> None:
                     raise ValueError(f"External include path is not a directory: {path}")
 
 
-def build_cluster_source_bundle(directory: Path) -> tuple[str, bytes]:
-    """Build an owned, deterministic gzip/USTAR source closure for R1 installation.
-
-    The digest identifies archive bytes; callers supply the enclosing installed
-    package namespace. It never appears in source, imports or archive members.
-    CHIP compilation/configuration stays on the parent and outside this bundle.
-    """
+def _cluster_source_payloads(directory: Path, budget: int) -> tuple[str, dict[str, bytes]]:
+    """Read one validated source closure within the remaining session budget."""
     from pypto.ir._cluster_artifacts import source_layout  # noqa: PLC0415
     from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
 
     directory = directory.resolve()
-    metadata = _read_cluster_source(directory, "distributed_meta.json", _CLUSTER_MAX_UNPACKED_BYTES)
+    metadata = _read_cluster_source(directory, "distributed_meta.json", budget)
     compiled = DistributedCompiledProgram.from_dir(directory)
     if compiled.entry_kind != "cluster":
         raise ValueError("A cluster source bundle requires schema-4 CLUSTER metadata")
@@ -261,14 +256,14 @@ def build_cluster_source_bundle(directory: Path) -> tuple[str, bytes]:
     bootstrap_path = "orchestration/cluster_bootstrap.py"
     # Bootstrap is a canonical runtime-only source, owned by the producer
     # rather than a mutable artifact file. Its bytes participate in the digest.
-    bootstrap = _read_cluster_source(
-        Path(__file__).parent, "cluster_bootstrap.py", _CLUSTER_MAX_UNPACKED_BYTES - len(metadata)
-    )
+    bootstrap = _read_cluster_source(Path(__file__).parent, "cluster_bootstrap.py", budget - len(metadata))
     paths.add(bootstrap_path)
     for entry in closure["entries"]:
         prefix = entry["logical_path"]
         source_path = f"{prefix}/orchestration/host_orch.py"
         paths.update({f"{prefix}/__init__.py", f"{prefix}/orchestration/__init__.py", source_path})
+        if (directory / prefix / "orchestration/_distributed_support.py").exists():
+            paths.add(f"{prefix}/orchestration/_distributed_support.py")
         if entry["sub_worker_paths"]:
             paths.add(f"{prefix}/sub_workers/__init__.py")
             paths.update(entry["sub_worker_paths"].values())
@@ -279,7 +274,7 @@ def build_cluster_source_bundle(directory: Path) -> tuple[str, bytes]:
     payloads = {"distributed_meta.json": metadata, bootstrap_path: bootstrap}
     total = len(metadata) + len(bootstrap)
     for path in sorted(paths - {"distributed_meta.json", bootstrap_path}):
-        data = _read_cluster_source(directory, path, _CLUSTER_MAX_UNPACKED_BYTES - total)
+        data = _read_cluster_source(directory, path, budget - total)
         payloads[path] = data
         total += len(data)
     # Bound the complete declared closure before any source reaches the AST
@@ -299,12 +294,20 @@ def build_cluster_source_bundle(directory: Path) -> tuple[str, bytes]:
             )
             if any(name == "pypto" or name.startswith("pypto.") for name in imports):
                 raise ValueError(f"Cluster runtime source imports PyPTO: {path}")
+    return compiled.entry_name, payloads
+
+
+def _encode_cluster_payloads(entry_name: str, sources: dict[str, bytes]) -> tuple[str, bytes]:
+    """Own a plain USTAR closure and stream it into a bounded gzip sink."""
+    payloads = dict(sources)
+    _check_cluster_member_paths(set(payloads) | {"bundle_manifest.json"})
+    total = sum(len(data) for data in payloads.values())
     # This manifest owns every selected relative member and its exact bytes.
     # It excludes its own hash, avoiding a digest/self-reference cycle.
     payloads["bundle_manifest.json"] = encode_manifest(
         {
             "schema": 1,
-            "entry_name": compiled.entry_name,
+            "entry_name": entry_name,
             "files": [
                 {"path": path, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
                 for path, data in sorted(payloads.items())
@@ -341,3 +344,83 @@ def build_cluster_source_bundle(directory: Path) -> tuple[str, bytes]:
                 archive.addfile(member, io.BytesIO(data))
     bundle = stream.getvalue()
     return hashlib.sha256(bundle).hexdigest(), bundle
+
+
+def build_cluster_source_bundle(directory: Path) -> tuple[str, bytes]:
+    """Build an owned deterministic source package, with namespace outside bytes."""
+    name, payloads = _cluster_source_payloads(directory, _CLUSTER_MAX_UNPACKED_BYTES)
+    return _encode_cluster_payloads(name, payloads)
+
+
+_SESSION_HELPER_EXPORTS = (
+    "_ChipCallables",
+    "_EmbeddedEntryState",
+    "_EmbeddedNodeState",
+    "_copy_return_tensor",
+    "make_tensor_arg",
+    "add_chip_tensor_arg",
+    "_submit_chip",
+    "_decode_scalar",
+    "_encode_scalar",
+    "_slice_tensor",
+    "_reshape_tensor",
+    "_record_dispatch_program",
+    "_resolve_chip_worker",
+    "_reset_dfx_dispatch_state",
+    "_dfx_rank_label",
+)
+
+
+def build_cluster_session_bundle(directories: list[Path]) -> tuple[str, bytes]:
+    """Relocate program closures around one canonical runtime-only helper/hook.
+
+    Input artifacts are immutable. Every helper copy is validated before a
+    source-relative shim replaces it in this privately owned aggregate.
+    """
+    payloads = {"__init__.py": b"", "programs/__init__.py": b"", "orchestration/__init__.py": b""}
+    helper = _read_cluster_source(
+        Path(__file__).parent, "_distributed_support.py", _CLUSTER_MAX_UNPACKED_BYTES
+    )
+    bootstrap = _read_cluster_source(
+        Path(__file__).parent, "cluster_bootstrap.py", _CLUSTER_MAX_UNPACKED_BYTES - len(helper)
+    )
+    payloads["orchestration/_distributed_support.py"] = helper
+    payloads["orchestration/cluster_bootstrap.py"] = bootstrap
+    programs = []
+    for index, directory in enumerate(directories):
+        remaining = _CLUSTER_MAX_UNPACKED_BYTES - sum(len(data) for data in payloads.values())
+        name, source = _cluster_source_payloads(directory, remaining)
+        if source["orchestration/cluster_bootstrap.py"] != bootstrap:
+            raise ValueError("Cluster session bootstrap contract mismatch")
+        prefix = f"programs/p{index}"
+        programs.append({"slot": f"p{index}", "entry_name": name})
+        for path, data in source.items():
+            if path == "orchestration/cluster_bootstrap.py":
+                continue
+            if path.endswith("/_distributed_support.py"):
+                if data != helper:
+                    raise ValueError(f"Cluster session helper contract mismatch: p{index}/{path}")
+                # Each level moves toward the session root; no sys.modules
+                # alias or import hook is needed for identical class objects.
+                relative = "." * len((prefix + "/" + path).split("/"))
+                data = (
+                    "from "
+                    + relative
+                    + "orchestration._distributed_support import (\n    "
+                    + ", ".join(_SESSION_HELPER_EXPORTS)
+                    + ",\n)\n"
+                ).encode()
+            elif path.endswith("/orchestration/__init__.py") and path != "orchestration/__init__.py":
+                if data != b"from ....orchestration import _distributed_support\n":
+                    raise ValueError(f"Cluster session helper package shim contract mismatch: {path}")
+            payloads[prefix + "/" + path] = data
+        _check_cluster_member_paths(set(payloads) | {"session_manifest.json", "bundle_manifest.json"})
+    payloads["session_manifest.json"] = encode_manifest(
+        {
+            "version": 1,
+            "programs": programs,
+            "helper_sha256": hashlib.sha256(helper).hexdigest(),
+            "bootstrap_sha256": hashlib.sha256(bootstrap).hexdigest(),
+        }
+    )
+    return _encode_cluster_payloads("session", payloads)

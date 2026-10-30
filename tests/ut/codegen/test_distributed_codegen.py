@@ -2119,7 +2119,8 @@ def _c3b_record_dt_geometry(source):
 
     domain = Domain()
     tensors = {name: domain for _, name, _, dtype in layout["scalar_slots"] if dtype == "comm_ctx"}
-    frame = SimpleNamespace(tensors=tensors, keepalive=[], ordering_tokens=lambda handles, rank: (token,))
+    frame = support._EmbeddedFrame(tensors, object())
+    frame.ordering_tokens = lambda handles, rank: (token,)
     namespace = {
         "TaskArgs": TaskArgs,
         "TensorArgType": SimpleNamespace(INPUT="input", OUTPUT_EXISTING="existing", INOUT="inout"),
@@ -2475,6 +2476,7 @@ def test_c3b_embedded_control_flow_preserves_live_ssa_and_metadata_positions(mod
             return SimpleNamespace(
                 device_ctx=self.device_ctx,
                 domain_size=12,
+                domain_rank=9,
                 buffers={
                     row[4]: SimpleNamespace(tensor=lambda **kwargs: window) for row in layout["window_slots"]
                 }
@@ -2503,7 +2505,8 @@ def test_c3b_embedded_control_flow_preserves_live_ssa_and_metadata_positions(mod
                 selected.append(by_domain[id(handle)])
         return tuple(selected)
 
-    frame = SimpleNamespace(tensors=tensors, keepalive=[], ordering_tokens=ordering_tokens)
+    frame = support._EmbeddedFrame(tensors, object())
+    frame.ordering_tokens = ordering_tokens
     calls = []
     namespace = {
         "TaskArgs": TaskArgs,
