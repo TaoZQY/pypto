@@ -1012,7 +1012,7 @@ def test_i2_uncertain_close_retains_domain_and_io_journals(i2_programs, i2_runne
         controller = prepared._session.controller
         caller_io = prepared._active_io
         assert caller_io is not None and caller_io._backings
-        assert all(path.exists() for _, _, path, _, _ in caller_io._backings)
+        assert all(backing.path.exists() for backing in caller_io._backings)
         io, keep = controller._active_io, tuple(controller._keep)
         assert io is not None and io.storages and keep
         before = list(state.events)
